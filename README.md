@@ -9,7 +9,7 @@
 [![Project](https://img.shields.io/badge/Project-Page-blue.svg)](https://emotag26.github.io/)
 
 <br>
-<img src="./assets/pipeline.png" alt="pipeline" style="zoom:80%;" />
+<img src="./assets/pipeline.png" alt="pipeline" style="zoom:80%; background-color: white;" />
 <br><br>
 
 ## 🚀 Code will be released to the public soon!
