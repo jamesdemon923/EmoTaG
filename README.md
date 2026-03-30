@@ -1,22 +1,29 @@
+<div align="center">
+
 # EmoTaG: Emotion-Aware Talking Head Synthesis on Gaussian Splatting with Few-Shot Personalization
 
-Official repository for our CVPR 2026 paper **EmoTaG: Emotion-Aware Talking Head Synthesis on Gaussian Splatting with Few-Shot Personalization**.
+**Official repository for our CVPR 2026 paper**
 
-[`Paper`](https://arxiv.org/pdf/2603.21332) | [`ArXiv`](https://arxiv.org/abs/2603.21332) | [`Project`](https://emotag26.github.io/)
+[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](https://arxiv.org/pdf/2603.21332)
+[![ArXiv](https://img.shields.io/badge/ArXiv-2603.21332-b31b1b.svg)](https://arxiv.org/abs/2603.21332)
+[![Project](https://img.shields.io/badge/Project-Page-blue.svg)](https://emotag26.github.io/)
 
+<br>
 <img src="./assets/pipeline.png" alt="pipeline" style="zoom:80%;" />
+<br><br>
 
-> **Code will be released to the public soon!**
+## 🚀 Code will be released to the public soon!
 
-## To-Do List
+</div>
 
-- [ ] Release inference code
-- [ ] Release pre-trained models
-- [ ] Release training code
+## 📝 To-Do List
+
+- [ ] Release inference code and pre-trained models
+- [ ] Release few-shot personalization (adaptation) code
+- [ ] Release pre-training code
 - [ ] Release data processing scripts
-- [ ] Update project page and video
 
-## Citation
+## 📖 Citation
 
 Consider citing as below if you find this repository helpful to your project:
 
@@ -28,5 +35,3 @@ Consider citing as below if you find this repository helpful to your project:
   year={2026}
 }
 ```
-
-
