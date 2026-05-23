@@ -233,7 +233,3 @@ If you find EmoTaG useful for your research, please consider citing:
   year      = {2026}
 }
 ```
-
-<div align="center">
-<sub>Made with care for the talking-head research community.</sub>
-</div>
