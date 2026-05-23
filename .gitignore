@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+build/
+*.egg-info/
+*.so
+*.mp4
+*.pth
+*.pt2
+
+# Face tracking and parsing models
+data_utils/face_tracking/3DMM/*
+data_utils/face_parsing/79999_iter.pth
+data_utils/sapiens/checkpoint/*
+
+# Python compiled files
+*.pyc
+.vscode
+build
+checkpoint
+gridencoder/gridencoder.egg-info
+diff_rasterization/diff_rast.egg-info
+diff_rasterization/dist
+tensorboard_3d
+screenshots
+
+# Data and output directories
+data/*
+output/*
+!*.gitkeep
+
+# Package installations and archives
+*.tar.gz
+*.zip
+*.whl
+mmcv-full-*/
+*.deb
+*.rpm
+
+# Environment and configuration
+.env
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# IDE and editor files
+.idea/
+*.swp
+*.swo
+*~
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
