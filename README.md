@@ -8,7 +8,7 @@
   <a href="https://www.youtube.com/watch?v=kEPHIu8I7HE"><img src="https://img.shields.io/badge/YouTube-Video-FF0000.svg?logo=youtube&logoColor=white" alt="Video"></a>
 </p>
 
-Official implementation of **EmoTaG: Emotion-Aware Talking Head Synthesis on Gaussian Splatting with Few-Shot Personalization** (CVPR 2026).
+Official implementation of **EmoTaG** (CVPR 2026).
 
 <img src="./img/pipeline.png" alt="EmoTaG overview" width="92%" />
 
@@ -23,7 +23,7 @@ Official implementation of **EmoTaG: Emotion-Aware Talking Head Synthesis on Gau
 ### 1. Clone the repository and create the environment
 
 ```bash
-git clone https://github.com/<user>/EmoTaG.git
+git clone https://github.com/jamesdemon923/EmoTaG.git
 cd EmoTaG
 git submodule update --init --recursive
 
@@ -31,7 +31,7 @@ conda env create --file environment_cu121.yml
 conda activate emotag
 ```
 
-### 2. Install PyTorch3D and CUDA extensions
+### 2. Install PyTorch3D and project submodules
 
 ```bash
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
@@ -148,7 +148,7 @@ python tools/repro_check.py --root data/<ID> --imports
 ### Pre-training (multi-identity)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python pretrain_emotag.py \
+python pretrain_emotag.py \
   -s data/pretrain \
   -m output/pretrain \
   --scene_names <ID_1>,<ID_2> \
@@ -160,7 +160,7 @@ CUDA_VISIBLE_DEVICES=0 python pretrain_emotag.py \
 ### Few-shot adaptation (target identity)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python adapt_emotag.py \
+python adapt_emotag.py \
   -s data/<ID> \
   -m output/<ID> \
   --audio_extractor wav2vec2 \
@@ -176,7 +176,7 @@ CUDA_VISIBLE_DEVICES=0 python adapt_emotag.py \
 Render a trained scene:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python synthesize.py \
+python synthesize.py \
   -s data/<ID> \
   -m output/<ID> \
   --use_train
@@ -189,7 +189,7 @@ CUDA_VISIBLE_DEVICES=0 python synthesize.py \
 ### Video-level metrics
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python evaluate_metrics.py video \
+python evaluate_metrics.py video \
   output/<ID>/train/rendered_video.mp4 \
   output/<ID>/train/gt_video.mp4 \
   output/<ID>/train
