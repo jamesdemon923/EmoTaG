@@ -53,10 +53,6 @@ pip install -e shencoder
 | [AdaFace](https://github.com/mk-minchul/adaface) | Identity embedding |
 | [Sapiens](https://github.com/facebookresearch/sapiens/blob/main/lite/README.md) | Depth and normal priors for adaptation |
 
-> `DeepFace` can be installed with `pip install deepface`. `AdaFace` is not
-> pip-installable: clone [mk-minchul/adaface](https://github.com/mk-minchul/adaface)
-> and download one of its released checkpoints (e.g. `adaface_ir101_webface12m.ckpt`).
-
 Export the FLAME / VHAP paths used by the preprocessing tools:
 
 ```bash
@@ -70,10 +66,10 @@ export EMOTAG_VHAP_ROOT=/path/to/VHAP
 
 EmoTaG is trained and evaluated on two public talking-head corpora:
 
-| Dataset | Role | Notes |
+| Dataset | Role | Subset used by EmoTaG |
 | :--- | :--- | :--- |
-| [HDTF](https://github.com/MRzzm/HDTF) | Multi-identity pre-training | 70 identities, 90–240 s each, used to learn the identity-agnostic audio-motion prior. |
-| [MEAD](https://wywu.github.io/projects/MEAD/MEAD.html) | Emotional evaluation | Emotional test set (5 emotions × 3 intensity levels), used for the emotion-intensity protocol. |
+| [HDTF](https://github.com/MRzzm/HDTF) | Multi-identity pre-training | 70 videos (one identity each, 90–240 s) sampled from HDTF, to learn the identity-agnostic audio-motion prior. |
+| [MEAD](https://wywu.github.io/projects/MEAD/MEAD.html) | Emotional evaluation | A subset of 5 emotions × 3 intensity levels (2 identities per emotion) from MEAD, for the emotional / emotion-intensity tests. |
 
 Please obtain both datasets from their official sources and follow their
 respective licenses. All clips are face-centered cropped and resized to
@@ -166,7 +162,7 @@ python tools/extract_adaface_identity.py \
 # -> data/<ID>/identity_feature.npy   shape [512]
 ```
 
-### Step 6 — Geometry priors (Sapiens, *adaptation only*)
+### Step 6 — Geometry priors (Sapiens)
 
 > Not required for pre-training.
 
@@ -217,11 +213,11 @@ python adapt_emotag.py \
   --pretrain_path output/pretrain/<ID_1>/chkpnt_ema_face_latest.pth \
   --iterations 20000 \
   --N_views 125 \
-  --adapt_adain_only          # tune only the AdaIN modulation params
+  --adapt_adain_only          
 ```
 
 > `--adapt_adain_only` freezes the pretrained GRMN and tunes only the AdaIN
-> modulation parameters. Omit it to fine-tune the full motion network.
+> modulation parameters.
 
 ---
 
@@ -257,14 +253,6 @@ python evaluate_metrics.py au \
   output/<ID>/train/gt_openface.csv \
   --output_dir output/<ID>/train
 ```
-
----
-
-## To-Do List
-
-- [ ] Release interactive demo
-
----
 
 ## Acknowledgements
 
