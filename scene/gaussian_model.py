@@ -14,8 +14,6 @@ from scene.neural_renderer import GridRenderer
 from scene.flame_binding import FLAMEBinding
 from scene.flame_wrapper import SimpleFlameWrapper
 from scene.flame_gaussian_model import FLAMEGaussianModel
-import pdb
-
 class GaussianModel:
 
     def setup_functions(self):

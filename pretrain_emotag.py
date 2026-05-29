@@ -1,6 +1,5 @@
 import os
 import random
-import pdb
 _mpl_config_dir = os.environ.get('MPLCONFIGDIR')
 if not _mpl_config_dir or not os.access(_mpl_config_dir, os.W_OK):
     os.environ['MPLCONFIGDIR'] = os.path.join('/tmp', 'emotag_mpl')
@@ -8,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch_ema import ExponentialMovingAverage
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, patchify, ssim
+from utils.loss_utils import l1_loss, l2_loss, patchify, ssim, semantic_emotion_guidance_loss
 from gaussian_renderer import render, render_motion
 import sys, copy
 from scene_pretrain import Scene, GaussianModel, MotionNetwork
@@ -139,6 +138,10 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         flame_wrapper = SimpleFlameWrapper(flame_params_file=flame_params_file).cuda()
         gaussians = GaussianModel(dataset)
         gaussians.flame_wrapper = flame_wrapper
+        # AdaFace identity descriptor.
+        identity_path = os.path.join(_dataset.source_path, 'identity_feature.npy')
+        if os.path.exists(identity_path):
+            gaussians.identity_feature = torch.from_numpy(np.load(identity_path).reshape(-1)).float().cuda()
         _dataset.model_center = model_center
         scene = Scene(_dataset, gaussians, debug_pre_binding=True)
         scene_list.append(scene)
@@ -244,6 +247,11 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
             w_rendering = 1.0
             w_flame_reg = opt.w_flame_reg
             loss = w_rendering * rendering_loss + w_flame_reg * flame_reg_loss
+            # Semantic Emotion Guidance (KL + score distillation).
+            emo_target = viewpoint_cam.talking_dict.get('emotion', None)
+            if emo_target is not None:
+                seg_loss, _, _ = semantic_emotion_guidance_loss(render_pkg.get('emotion_logits'), render_pkg.get('gate'), emo_target, viewpoint_cam.talking_dict.get('emotion_score', 0.0), w_kl=opt.w_emotion_kl, w_score=opt.w_emotion_score)
+                loss = loss + seg_loss
             loss.backward()
         if iteration > warm_up_iter:
             flame_debugger.record_flame_params(iteration, current_scene_name, current_frame_id, pred_exp, pred_jaw, gt_exp, gt_jaw, rendering_loss, flame_reg_loss)

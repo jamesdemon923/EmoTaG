@@ -3,8 +3,6 @@ import torch.nn as nn
 import numpy as np
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_multiply
 import trimesh
-import pdb
-
 def safe_normalize(x: torch.Tensor, eps: float=1e-20) -> torch.Tensor:
     """Internal helper."""
     return x / torch.sqrt(torch.clamp(torch.sum(x * x, -1, keepdim=True), min=eps))

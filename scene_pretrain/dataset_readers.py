@@ -10,10 +10,10 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from tqdm import tqdm
 import pandas as pd
-import pdb
 from utils.sh_utils import SH2RGB
 from utils.audio_utils import get_audio_features
 from utils.au_utils import load_openface_au_csv
+from utils.emotion_utils import load_emotion_features, emotion_score_from_distribution
 from scene.gaussian_model import BasicPointCloud
 
 class CameraInfo(NamedTuple):
@@ -115,6 +115,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         aud_features = aud_features.float().permute(0, 2, 1)
         auds = aud_features
         au_features = loadAUFeatures(path, frames)
+        # DeepFace emotion teacher.
+        emotion_features = None
+        emotion_path = os.path.join(path, 'emotion_features.npy')
+        if os.path.exists(emotion_path):
+            max_frame_id = max((int(frame.get('timestep_index', idx)) for idx, frame in enumerate(frames)))
+            emotion_features = load_emotion_features(emotion_path, required_len=max_frame_id + 1)
         ldmks_lips = []
         ldmks_mouth = []
         ldmks_lhalf = []
@@ -199,6 +205,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             talking_dict['frame_id'] = img_id
             au_idx = min(int(img_id), au_features.shape[0] - 1)
             talking_dict['au_features'] = torch.from_numpy(au_features[au_idx]).float()
+            if emotion_features is not None:
+                emo_idx = min(int(img_id), emotion_features.shape[0] - 1)
+                p_emo = emotion_features[emo_idx]
+                talking_dict['emotion'] = torch.from_numpy(p_emo).float()
+                talking_dict['emotion_score'] = float(emotion_score_from_distribution(p_emo))
             [xmin, xmax, ymin, ymax] = ldmks_lips[idx].tolist()
             cx = (xmin + xmax) // 2
             cy = (ymin + ymax) // 2

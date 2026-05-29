@@ -165,6 +165,16 @@ def check_scene(scene_root: Path) -> list[CheckResult]:
         results.append(CheckResult('au_features.csv', ok, detail))
     else:
         results.append(CheckResult('au_features.csv', False, 'missing; expected OpenFace columns AU01_r, AU04_r, AU05_r, AU06_r, AU07_r, AU45_r'))
+    emotion_path = scene_root / 'emotion_features.npy'
+    if emotion_path.exists():
+        results.append(CheckResult('emotion_features.npy', True, shape_for_npy(emotion_path)))
+    else:
+        results.append(CheckResult('emotion_features.npy', False, 'missing; run tools/extract_deepface_emotion.py'))
+    identity_path = scene_root / 'identity_feature.npy'
+    if identity_path.exists():
+        results.append(CheckResult('identity_feature.npy', True, shape_for_npy(identity_path)))
+    else:
+        results.append(CheckResult('identity_feature.npy', False, 'missing; run tools/extract_adaface_identity.py'))
     raw_videos = sorted(scene_root.glob('*.mp4'))
     results.append(CheckResult('raw_mp4_count', True, str(len(raw_videos))))
     expected_dirs = ('ori_imgs', 'gt_imgs', 'parsing', 'torso_imgs')

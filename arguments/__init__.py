@@ -92,6 +92,12 @@ class OptimizationParams(ParamGroup):
         self.warm_up_iter_per_scene = 500
         self.w_flame_reg = 0.1
         self.batch_size = 6
+        # Semantic Emotion Guidance (DeepFace teacher) loss weights.
+        self.w_emotion_kl = 0.01
+        self.w_emotion_score = 0.1
+        # Geometric loss (Sapiens depth/normal priors) weights, adaptation only.
+        self.w_geo_depth = 0.01
+        self.w_geo_normal = 0.001
         super().__init__(parser, 'Optimization Parameters')
 
 def get_combined_args(parser: ArgumentParser):

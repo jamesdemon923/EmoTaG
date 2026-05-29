@@ -1,6 +1,5 @@
 import torch
 import math
-import pdb
 import torch.nn.functional as F
 import sys
 from diff_gauss import GaussianRasterizationSettings, GaussianRasterizer
@@ -8,8 +7,6 @@ from scene.gaussian_model import GaussianModel
 from scene.motion_net import MotionNetwork
 from utils.sh_utils import eval_sh
 import numpy as np
-import pdb
-
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None):
     """
     Render the scene. 
@@ -63,7 +60,10 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     audio_feat = viewpoint_camera.talking_dict['auds'].cuda()
     au_feat = viewpoint_camera.talking_dict['au_features'].cuda()
-    preds = motion_net(audio_feat, au=au_feat)
+    identity_feat = getattr(pc, 'identity_feature', None)
+    if identity_feat is not None:
+        identity_feat = identity_feat.cuda()
+    preds = motion_net(audio_feat, au=au_feat, identity=identity_feat)
     pred_exp_raw = preds['flame_exp']
     pred_jaw_raw = preds['flame_jaw']
     if pred_exp_raw.dim() == 1:
@@ -139,5 +139,5 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
             pass
     means2D = screenspace_points
     rendered_image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(means3D=means3D, means2D=means2D, shs=shs, colors_precomp=colors_precomp, opacities=opacity, scales=scales, rotations=rotations, cov3Ds_precomp=None)
-    return_dict = {'render': rendered_image, 'viewspace_points': screenspace_points, 'visibility_filter': radii > 0, 'depth': rendered_depth, 'alpha': rendered_alpha, 'normal': rendered_norm, 'radii': radii, 'predicted_flame_exp': pred_exp_raw, 'predicted_flame_jaw': pred_jaw_raw, 'gt_flame_exp': gt_exp_feat, 'gt_flame_pose': gt_pose, 'deformed_flame_verts': flame_verts, 'deformed_xyz': means3D, 'deformed_rotations': rotations, 'deformed_raw_scale': deformed_gaussians['raw_scale']}
+    return_dict = {'render': rendered_image, 'viewspace_points': screenspace_points, 'visibility_filter': radii > 0, 'depth': rendered_depth, 'alpha': rendered_alpha, 'normal': rendered_norm, 'radii': radii, 'predicted_flame_exp': pred_exp_raw, 'predicted_flame_jaw': pred_jaw_raw, 'gt_flame_exp': gt_exp_feat, 'gt_flame_pose': gt_pose, 'deformed_flame_verts': flame_verts, 'deformed_xyz': means3D, 'deformed_rotations': rotations, 'deformed_raw_scale': deformed_gaussians['raw_scale'], 'gate': preds.get('gate'), 'emotion_logits': preds.get('emotion_logits')}
     return return_dict

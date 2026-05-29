@@ -70,6 +70,15 @@ class MotionNetwork(nn.Module):
                 nn.init.zeros_(module.bias)
         nn.init.zeros_(self.au_fusion.weight)
         nn.init.zeros_(self.au_fusion.bias)
+        # AdaIN modulation of the audio and AU/expression streams, driven by the
+        # AdaFace identity descriptor `s`.
+        self.identity_dim = 512
+        self.audio_adain = nn.Sequential(nn.Linear(self.identity_dim, self.hidden_dim), nn.ReLU(inplace=True), nn.Linear(self.hidden_dim, 2 * self.audio_dim))
+        self.au_adain = nn.Sequential(nn.Linear(self.identity_dim, self.hidden_dim), nn.ReLU(inplace=True), nn.Linear(self.hidden_dim, 2 * self.au_hidden_dim))
+        for adain in (self.audio_adain, self.au_adain):
+            last = adain[-1]
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
         self.bound = 0.15
         self.num_levels = 12
         self.level_dim = 1
@@ -128,6 +137,24 @@ class MotionNetwork(nn.Module):
             return (pooled, None)
         return pooled
 
+    @staticmethod
+    def _prepare_identity(identity, device=None, dtype=None):
+        if identity is None:
+            return None
+        identity = torch.as_tensor(identity, device=device, dtype=dtype)
+        if identity.dim() == 1:
+            identity = identity.unsqueeze(0)
+        return identity
+
+    def _adain(self, feat: torch.Tensor, identity: torch.Tensor, mlp: nn.Module) -> torch.Tensor:
+        """Adaptive Instance Normalization conditioned on the identity descriptor."""
+        params = mlp(identity)
+        gamma, beta = params.chunk(2, dim=-1)
+        mean = feat.mean(dim=-1, keepdim=True)
+        std = feat.std(dim=-1, keepdim=True) + 1e-05
+        normed = (feat - mean) / std
+        return (1.0 + gamma) * normed + beta
+
     def encode_au(self, au: torch.Tensor=None, batch_size: int=1, device=None, dtype=None) -> torch.Tensor:
         if device is None:
             device = next(self.parameters()).device
@@ -163,12 +190,17 @@ class MotionNetwork(nn.Module):
         feat_xz = self.encoder_xz(xz, bound=bound)
         return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
 
-    def decode_motion(self, aud_feat: torch.Tensor, c: torch.Tensor=None, au: torch.Tensor=None) -> dict:
+    def decode_motion(self, aud_feat: torch.Tensor, c: torch.Tensor=None, au: torch.Tensor=None, identity: torch.Tensor=None) -> dict:
+        identity = self._prepare_identity(identity, device=aud_feat.device, dtype=aud_feat.dtype)
+        if identity is not None:
+            aud_feat = self._adain(aud_feat, identity, self.audio_adain)
         h = aud_feat
         if self.individual_dim > 0 and c is not None:
             h = torch.cat([h, c], dim=-1)
         shared = self.backbone_net(h)
         au_feat = self.encode_au(au, batch_size=shared.shape[0], device=shared.device, dtype=shared.dtype)
+        if identity is not None:
+            au_feat = self._adain(au_feat, identity, self.au_adain)
         shared = shared + self.au_fusion(au_feat)
         base_exp = self.flame_exp_head(shared)
         base_jaw = self.flame_jaw_head(shared)
@@ -181,9 +213,9 @@ class MotionNetwork(nn.Module):
         pred_jaw = motion[..., self.flame_exp_dim:]
         return {'flame_exp': pred_exp, 'flame_jaw': pred_jaw, 'encoded_motion': shared, 'base_flame_exp': base_exp, 'base_flame_jaw': base_jaw, 'residual_flame_exp': residual_motion[..., :self.flame_exp_dim], 'residual_flame_jaw': residual_motion[..., self.flame_exp_dim:], 'gate': gate, 'emotion_logits': self.emotion_head(shared)}
 
-    def predict_jaw_from_audio(self, a: torch.Tensor, c: torch.Tensor=None, au: torch.Tensor=None) -> torch.Tensor:
+    def predict_jaw_from_audio(self, a: torch.Tensor, c: torch.Tensor=None, au: torch.Tensor=None, identity: torch.Tensor=None) -> torch.Tensor:
         aud_feat = self.encode_audio(a)
-        return self.decode_motion(aud_feat, c=c, au=au)['flame_jaw']
+        return self.decode_motion(aud_feat, c=c, au=au, identity=identity)['flame_jaw']
 
     def forward_mouth(self, xyz: torch.Tensor, a: torch.Tensor, mouth_mask: torch.Tensor=None, c: torch.Tensor=None, encoded_audio: torch.Tensor=None):
         if mouth_mask is not None:
@@ -222,13 +254,13 @@ class MotionNetwork(nn.Module):
         d_scale = pred[..., 7:10] * 0.001
         return {'d_mu': d_mu, 'd_rot': d_rot, 'd_scale': d_scale}
 
-    def forward(self, a, c=None, au=None):
+    def forward(self, a, c=None, au=None, identity=None):
         aud_feat, spk_logits = self.encode_audio(a, return_logits=True)
         if aud_feat is None:
             device = next(self.parameters()).device
             batch = 1
             return {'flame_exp': torch.zeros(batch, self.flame_exp_dim, device=device), 'flame_jaw': torch.zeros(batch, self.flame_jaw_dim, device=device), 'encoded_audio': None, 'gate': torch.zeros(batch, 1, device=device), 'emotion_logits': torch.zeros(batch, 7, device=device)}
-        results = self.decode_motion(aud_feat, c=c, au=au)
+        results = self.decode_motion(aud_feat, c=c, au=au, identity=identity)
         results.update({'encoded_audio': aud_feat})
         self.cache = results
         return results
@@ -245,7 +277,16 @@ class MotionNetwork(nn.Module):
         return super().load_state_dict(state_dict, strict=strict)
 
     def get_params(self, lr, lr_net, wd=0):
-        params = [{'params': self.audio_proj.parameters(), 'name': 'neural_audio_proj', 'lr': lr_net, 'weight_decay': wd}, {'params': self.audio_transformer.parameters(), 'name': 'neural_audio_transformer', 'lr': lr_net, 'weight_decay': wd}, {'params': self.pos_encoder.parameters(), 'name': 'neural_pos_encoder', 'lr': lr_net, 'weight_decay': wd}, {'params': self.au_encoder.parameters(), 'name': 'neural_au_encoder', 'lr': lr_net, 'weight_decay': wd}, {'params': self.au_fusion.parameters(), 'name': 'neural_au_fusion', 'lr': lr_net, 'weight_decay': wd}, {'params': self.encoder_xy.parameters(), 'name': 'neural_encoder_xy', 'lr': lr}, {'params': self.encoder_yz.parameters(), 'name': 'neural_encoder_yz', 'lr': lr}, {'params': self.encoder_xz.parameters(), 'name': 'neural_encoder_xz', 'lr': lr}, {'params': self.mouth_mlp.parameters(), 'name': 'neural_mouth_mlp', 'lr': lr_net, 'weight_decay': wd}, {'params': self.mouth_head.parameters(), 'name': 'neural_mouth_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.backbone_net.parameters(), 'name': 'neural_backbone_net', 'lr': lr_net, 'weight_decay': wd}, {'params': self.flame_exp_head.parameters(), 'name': 'neural_flame_exp_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.flame_jaw_head.parameters(), 'name': 'neural_flame_jaw_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.residual_net.parameters(), 'name': 'neural_grmn_residual_net', 'lr': lr_net, 'weight_decay': wd}, {'params': self.residual_motion_head.parameters(), 'name': 'neural_grmn_residual_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.gate_net.parameters(), 'name': 'neural_grmn_gate', 'lr': lr_net, 'weight_decay': wd}, {'params': self.emotion_head.parameters(), 'name': 'neural_grmn_emotion_head', 'lr': lr_net, 'weight_decay': wd}]
+        params = [{'params': self.audio_proj.parameters(), 'name': 'neural_audio_proj', 'lr': lr_net, 'weight_decay': wd}, {'params': self.audio_transformer.parameters(), 'name': 'neural_audio_transformer', 'lr': lr_net, 'weight_decay': wd}, {'params': self.pos_encoder.parameters(), 'name': 'neural_pos_encoder', 'lr': lr_net, 'weight_decay': wd}, {'params': self.au_encoder.parameters(), 'name': 'neural_au_encoder', 'lr': lr_net, 'weight_decay': wd}, {'params': self.au_fusion.parameters(), 'name': 'neural_au_fusion', 'lr': lr_net, 'weight_decay': wd}, {'params': self.audio_adain.parameters(), 'name': 'neural_audio_adain', 'lr': lr_net, 'weight_decay': wd}, {'params': self.au_adain.parameters(), 'name': 'neural_au_adain', 'lr': lr_net, 'weight_decay': wd}, {'params': self.encoder_xy.parameters(), 'name': 'neural_encoder_xy', 'lr': lr}, {'params': self.encoder_yz.parameters(), 'name': 'neural_encoder_yz', 'lr': lr}, {'params': self.encoder_xz.parameters(), 'name': 'neural_encoder_xz', 'lr': lr}, {'params': self.mouth_mlp.parameters(), 'name': 'neural_mouth_mlp', 'lr': lr_net, 'weight_decay': wd}, {'params': self.mouth_head.parameters(), 'name': 'neural_mouth_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.backbone_net.parameters(), 'name': 'neural_backbone_net', 'lr': lr_net, 'weight_decay': wd}, {'params': self.flame_exp_head.parameters(), 'name': 'neural_flame_exp_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.flame_jaw_head.parameters(), 'name': 'neural_flame_jaw_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.residual_net.parameters(), 'name': 'neural_grmn_residual_net', 'lr': lr_net, 'weight_decay': wd}, {'params': self.residual_motion_head.parameters(), 'name': 'neural_grmn_residual_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.gate_net.parameters(), 'name': 'neural_grmn_gate', 'lr': lr_net, 'weight_decay': wd}, {'params': self.emotion_head.parameters(), 'name': 'neural_grmn_emotion_head', 'lr': lr_net, 'weight_decay': wd}]
         if self.individual_dim > 0:
             params.extend([{'params': self.individual_codes, 'name': 'neural_individual_codes', 'lr': lr, 'weight_decay': wd}])
         return params
+
+    def freeze_for_adaptation(self):
+        """Freeze the motion prior and tune only the AdaIN modulation parameters."""
+        adain_modules = (self.audio_adain, self.au_adain)
+        for param in self.parameters():
+            param.requires_grad_(False)
+        for module in adain_modules:
+            for param in module.parameters():
+                param.requires_grad_(True)

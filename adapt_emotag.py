@@ -3,7 +3,7 @@ import random
 import torch
 import torch.nn.functional as F
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, patchify, ssim, normalize
+from utils.loss_utils import l1_loss, l2_loss, patchify, ssim, normalize, semantic_emotion_guidance_loss
 from gaussian_renderer import render, render_motion
 import sys
 from scene import Scene, GaussianModel, MotionNetwork
@@ -26,9 +26,7 @@ import matplotlib.pyplot as plt
 from torchvision.utils import save_image
 import numpy as np
 from PIL import Image
-import pdb
-
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, mode_long, pretrain_ckpt_path, warm_up_iter):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, mode_long, pretrain_ckpt_path, warm_up_iter, adapt_adain_only=False):
     scene_name = os.path.basename(dataset.model_path)
     loss_history = {scene_name: []}
     testing_iterations = [1] + [i for i in range(0, opt.iterations + 1, 10000)]
@@ -55,10 +53,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     flame_wrapper = SimpleFlameWrapper(flame_params_file=flame_params_file).cuda()
     gaussians = GaussianModel(dataset)
     gaussians.flame_wrapper = flame_wrapper
+    # AdaFace identity descriptor.
+    identity_path = os.path.join(dataset.source_path, 'identity_feature.npy')
+    if os.path.exists(identity_path):
+        gaussians.identity_feature = torch.from_numpy(np.load(identity_path).reshape(-1)).float().cuda()
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     motion_params, _, _ = torch.load(pretrain_ckpt_path)
     motion_net.load_state_dict(motion_params)
+    if adapt_adain_only:
+        motion_net.freeze_for_adaptation()
     try:
         mouth_idx_path = os.path.join(dataset.source_path, 'mouth_point_indices.npy')
         mouth_indices_np = np.load(mouth_idx_path)
@@ -157,6 +161,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             w_rendering = 1.0
             w_flame_reg = 0.1
             loss = w_rendering * rendering_loss + w_flame_reg * flame_reg_loss
+            # Semantic Emotion Guidance (KL + score distillation).
+            emo_target = viewpoint_cam.talking_dict.get('emotion', None)
+            if emo_target is not None:
+                seg_loss, _, _ = semantic_emotion_guidance_loss(render_pkg.get('emotion_logits'), render_pkg.get('gate'), emo_target, viewpoint_cam.talking_dict.get('emotion_score', 0.0), w_kl=opt.w_emotion_kl, w_score=opt.w_emotion_score)
+                loss = loss + seg_loss
+            # Geometric loss against Sapiens depth/normal pseudo ground-truth.
+            normal_gt = viewpoint_cam.talking_dict.get('normal', None)
+            depth_gt = viewpoint_cam.talking_dict.get('depth', None)
+            if normal_gt is not None or depth_gt is not None:
+                try:
+                    geo_mask = head_mask[:1]
+                    if depth_gt is not None:
+                        rendered_depth = render_pkg['depth']
+                        depth_gt = depth_gt.to(rendered_depth.device).reshape(rendered_depth.shape)
+                        depth_loss = l1_loss(geo_mask * normalize(rendered_depth), geo_mask * normalize(depth_gt))
+                        loss = loss + opt.w_geo_depth * depth_loss
+                    if normal_gt is not None:
+                        rendered_normal = render_pkg['normal']
+                        normal_gt = normal_gt.to(rendered_normal.device).reshape(rendered_normal.shape)
+                        normal_loss = l1_loss(geo_mask * rendered_normal, geo_mask * normal_gt)
+                        loss = loss + opt.w_geo_normal * normal_loss
+                except Exception as geo_exc:
+                    if not getattr(training, '_geo_warned', False):
+                        print(f'[warn] Skipping geometric loss (shape mismatch?): {geo_exc}')
+                        training._geo_warned = True
             flame_debugger.record_flame_params(iteration, scene_name, current_frame_id, pred_exp, pred_jaw, gt_exp, gt_jaw, rendering_loss, flame_reg_loss)
         loss.backward()
         iter_end.record()
@@ -177,9 +206,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 stats_tracker.save_intermediate_report(iteration)
             if iteration in [1000, 5000, 10000, 20000, 30000, 40000]:
                 image_debugger.save_specific_iteration_images(iteration, scene_name, current_frame_id, rendered_image, gt_image)
-            if iteration in saving_iterations:
+            if iteration in saving_iterations and iteration > warm_up_iter and 'deformed_xyz' in render_pkg:
                 print('\n[ITER {}] Saving Gaussians'.format(iteration))
-                scene.save_deformed(str(iteration) + '_face', deformed_xyz, deformed_rotations)
+                scene.save_deformed(str(iteration) + '_face', render_pkg['deformed_xyz'], render_pkg['deformed_rotations'], render_pkg['deformed_raw_scale'])
             if iteration in checkpoint_iterations:
                 print('\n[ITER {}] Saving Checkpoint'.format(iteration))
                 ckpt = (gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
@@ -258,10 +287,11 @@ if __name__ == '__main__':
     parser.add_argument('--long', action='store_true', default=False)
     parser.add_argument('--pretrain_path', type=str, default=None)
     parser.add_argument('--warm_up_iter', type=int, default=500, help='Number of warm-up iterations with static rendering only')
+    parser.add_argument('--adapt_adain_only', action='store_true', default=False, help='Freeze the pretrained GRMN and tune only the AdaIN modulation parameters')
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     print('Optimizing ' + args.model_path)
     safe_state(args.quiet)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.long, args.pretrain_path, args.warm_up_iter)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.long, args.pretrain_path, args.warm_up_iter, args.adapt_adain_only)
     print('\nTraining complete.')

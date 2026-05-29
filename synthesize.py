@@ -60,6 +60,9 @@ def render_sets(dataset: ModelParams, pipeline: PipelineParams, use_train: bool)
 
         dataset.model_center = np.load(model_center_path)
         gaussians.flame_wrapper = SimpleFlameWrapper(flame_params_file=flame_params_file).cuda()
+        identity_path = os.path.join(dataset.source_path, "identity_feature.npy")
+        if os.path.exists(identity_path):
+            gaussians.identity_feature = torch.from_numpy(np.load(identity_path).reshape(-1)).float().cuda()
         scene = Scene(dataset, gaussians, shuffle=False)
         motion_net = MotionNetwork(args=dataset).cuda()
 

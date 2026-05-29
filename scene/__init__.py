@@ -68,9 +68,9 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, 'point_cloud/iteration_{}'.format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, 'point_cloud.ply'))
 
-    def save_deformed(self, iteration, deformed_xyz, deformed_rotations):
+    def save_deformed(self, iteration, deformed_xyz, deformed_rotations, deformed_raw_scale):
         point_cloud_path = os.path.join(self.model_path, 'point_cloud/iteration_{}'.format(iteration))
-        self.gaussians.save_deformed_ply(deformed_xyz, deformed_rotations, os.path.join(point_cloud_path, 'point_cloud_deformed.ply'))
+        self.gaussians.save_deformed_ply(deformed_xyz, deformed_rotations, deformed_raw_scale, os.path.join(point_cloud_path, 'point_cloud_deformed.ply'))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

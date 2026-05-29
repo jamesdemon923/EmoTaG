@@ -8,8 +8,6 @@ from scene.gaussian_model import GaussianModel
 from scene.motion_net import MotionNetwork
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-import pdb
-
 class Scene:
     gaussians: GaussianModel
 

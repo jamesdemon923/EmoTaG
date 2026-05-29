@@ -3,8 +3,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Dict, Tuple
-import pdb
-
 def dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Internal helper."""
     return torch.sum(x * y, -1, keepdim=True)

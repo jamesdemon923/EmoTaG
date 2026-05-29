@@ -15,6 +15,31 @@ def patchify(input, patch_size):
 def l1_loss(network_output, gt):
     return torch.abs(network_output - gt).mean()
 
+def semantic_emotion_guidance_loss(emotion_logits, gate, p_emo, score, w_kl=0.01, w_score=0.1):
+    """Distill the DeepFace teacher into the residual and gate branches.
+
+      L_KL    = KL(p_emo || softmax(z_e))   aligns the emotion latent.
+      L_Score = |g - e|                     matches the gate to the intensity.
+    Returns (total, kl_loss, score_loss).
+    """
+    if emotion_logits is None or gate is None or p_emo is None:
+        zero = torch.zeros((), device=gate.device if gate is not None else 'cpu')
+        return zero, zero, zero
+    if emotion_logits.dim() == 1:
+        emotion_logits = emotion_logits.unsqueeze(0)
+    if emotion_logits.shape[0] > 1:
+        emotion_logits = emotion_logits.mean(dim=0, keepdim=True)
+    if gate.dim() == 1:
+        gate = gate.unsqueeze(0)
+    if gate.shape[0] > 1:
+        gate = gate.mean(dim=0, keepdim=True)
+    p_emo = p_emo.to(emotion_logits.device).reshape(1, -1)
+    log_pred = F.log_softmax(emotion_logits, dim=-1)
+    kl_loss = F.kl_div(log_pred, p_emo, reduction='batchmean')
+    score_target = torch.as_tensor(score, device=gate.device, dtype=gate.dtype).reshape(1, 1)
+    score_loss = torch.abs(gate.reshape(1, 1) - score_target).mean()
+    return w_kl * kl_loss + w_score * score_loss, kl_loss, score_loss
+
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
