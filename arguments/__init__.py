@@ -90,7 +90,14 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.random_background = False
         self.warm_up_iter_per_scene = 500
+        # Fraction of total iterations used to ramp curriculum_weight 0 -> 1 after warmup.
+        self.curriculum_ratio = 0.1
         self.w_flame_reg = 0.1
+        # Extra weight on the jaw term inside flame_reg. Jaw pose (3 dims, radians,
+        # MSE ~1e-3) is the lip-sync driver but is drowned by the 50-dim expression
+        # MSE (~0.2-0.8); without reweighting the jaw regression tends to collapse
+        # toward the mean.
+        self.w_jaw_reg = 100.0
         self.batch_size = 6
         # Semantic Emotion Guidance (DeepFace teacher) loss weights.
         self.w_emotion_kl = 0.01
@@ -98,6 +105,27 @@ class OptimizationParams(ParamGroup):
         # Geometric loss (Sapiens depth/normal priors) weights, adaptation only.
         self.w_geo_depth = 0.01
         self.w_geo_normal = 0.001
+        # GaussianAvatars-style anti-drift regularizers (adaptation only): penalize
+        # gaussian offsets / scales that exceed a threshold measured in units of the
+        # parent FLAME triangle's size. Defaults follow GaussianAvatars.
+        self.lambda_xyz = 0.01
+        self.threshold_xyz = 1.0
+        self.lambda_scale = 1.0
+        self.threshold_scale = 0.6
+        # Perceptual (LPIPS) loss in the adaptation dynamic stage. The L1/SSIM optimum
+        # under residual geometric misalignment is a motion-blurred average texture on
+        # frames away from the adaptation set; a perceptual term preserves
+        # high-frequency facial detail. 0 disables.
+        self.w_lpips = 0.1
+        # Extra photometric weight on the lips_rect crop during adaptation. The mouth
+        # interior (teeth/tongue) is visible in only a handful of the 125 adaptation
+        # frames and gets almost no gradient share from full-frame losses; the
+        # original pipeline had a dedicated mouth training stage for this. 0 disables.
+        self.w_mouth_crop = 0.5
+        # Cap the intra-oral gaussian set at this multiple of its anatomical initial
+        # count during adaptation: enough headroom for teeth/tongue detail while
+        # preventing the mouth set from growing to dominate the whole head.
+        self.mouth_budget_factor = 4.0
         super().__init__(parser, 'Optimization Parameters')
 
 def get_combined_args(parser: ArgumentParser):

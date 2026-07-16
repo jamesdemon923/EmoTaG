@@ -34,6 +34,10 @@ def load_openface_au_csv(path: str | Path, required_len: int | None = None) -> n
         raise ValueError(f"{csv_path} is missing AU columns: {', '.join(missing)}")
 
     au_features = np.stack(values, axis=1).astype(np.float32)
+    # Stabilize blinking: AU45 (last channel) is clipped to [0, 2]; the remaining
+    # AUs keep their original OpenFace intensities (paper, Supp. Sec. B.2).
+    au45_index = AU_BASE_COLUMNS.index("AU45")
+    au_features[:, au45_index] = np.clip(au_features[:, au45_index], 0.0, 2.0)
     if required_len is not None and au_features.shape[0] < required_len:
         pad = np.repeat(au_features[-1:], required_len - au_features.shape[0], axis=0)
         au_features = np.concatenate([au_features, pad], axis=0)

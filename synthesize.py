@@ -14,6 +14,7 @@ from gaussian_renderer import render_motion
 from scene import GaussianModel, MotionNetwork, Scene
 from scene.flame_wrapper import SimpleFlameWrapper
 from utils.general_utils import safe_state
+from utils.mask_utils import unpack_bool_mask
 
 
 def render_set(model_path, name, views, gaussians, motion_net, pipeline, background):
@@ -30,7 +31,15 @@ def render_set(model_path, name, views, gaussians, motion_net, pipeline, backgro
             render_pkg = render_motion(view, gaussians, motion_net, pipeline, background)
             rendered_image = render_pkg["render"]
             rendered_frame = (rendered_image.clamp(0, 1).permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
-            gt_frame = (view.original_image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            # GT must match the training convention the renders were optimized against:
+            # head region composited over the same (green) background. original_image is
+            # stored 0..255; scaling it by 255 again wraps around and inverts the colors.
+            gt = view.original_image.cuda().float()
+            if gt.max() > 1.5:
+                gt = gt / 255.0
+            face_mask = torch.as_tensor(unpack_bool_mask(view.talking_dict["face_mask"])).cuda()
+            gt = gt * face_mask + background[:, None, None] * ~face_mask
+            gt_frame = (gt.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             rendered_frames.append(rendered_frame)
             gt_frames.append(gt_frame)
 
@@ -64,6 +73,13 @@ def render_sets(dataset: ModelParams, pipeline: PipelineParams, use_train: bool)
         if os.path.exists(identity_path):
             gaussians.identity_feature = torch.from_numpy(np.load(identity_path).reshape(-1)).float().cuda()
         scene = Scene(dataset, gaussians, shuffle=False)
+        # Select the per-identity code this scene was trained with (written by the
+        # pretrain scripts); without it render_motion falls back to code index 0.
+        identity_index_path = os.path.join(dataset.model_path, "identity_index.txt")
+        if os.path.exists(identity_index_path):
+            with open(identity_index_path) as f:
+                gaussians.identity_index = int(f.read().strip())
+            print(f"Using per-identity code index {gaussians.identity_index}")
         motion_net = MotionNetwork(args=dataset).cuda()
 
         checkpoint_path = os.path.join(dataset.model_path, "chkpnt_face_latest.pth")
@@ -75,7 +91,10 @@ def render_sets(dataset: ModelParams, pipeline: PipelineParams, use_train: bool)
         motion_net.load_state_dict(motion_params, strict=False)
         gaussians.restore(model_params, None)
 
-        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+        # Must match the training/adaptation background (green [0,1,0]); the model is
+        # trained against green-screen GT and prunes green-coloured gaussians, so
+        # rendering on black/white would mismatch GT and wreck PSNR/LPIPS at eval.
+        bg_color = [0, 1, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         dataset_name = "train" if use_train else "test"
         views = scene.getTrainCameras() if use_train else scene.getTestCameras()

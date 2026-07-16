@@ -14,6 +14,7 @@ from utils.sh_utils import SH2RGB
 from utils.audio_utils import get_audio_features
 from utils.au_utils import load_openface_au_csv
 from utils.emotion_utils import load_emotion_features, emotion_score_from_distribution
+from utils.mask_utils import pack_bool_mask
 from scene.gaussian_model import BasicPointCloud
 
 class CameraInfo(NamedTuple):
@@ -148,9 +149,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             cam_name = os.path.join(path, 'gt_imgs', str(img_id) + extension)
             c2w = np.array(frame['transform_matrix'])
             c2w[:3, 1:3] *= -1
-            c2w[:3, 3] *= 1 / 2.4
-            if model_center is not None:
-                c2w[:3, 3] += model_center
+            # Use the VHAP-exported camera as-is (do not rescale translation or shift
+            # by model_center); this keeps the tracked mesh projecting onto GT pixels.
             w2c = np.linalg.inv(c2w)
             R = np.transpose(w2c[:3, :3])
             T = w2c[:3, 3]
@@ -186,11 +186,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                     mouth_interior_mask = (mask[:, :, 0] == 100) & (mask[:, :, 1] == 100) & (mask[:, :, 2] == 100)
                     neck_mask = (mask[:, :, 0] == 0) & (mask[:, :, 1] == 255) & (mask[:, :, 2] == 0)
                     complete_head_mask = hair_mask | skin_mask | mouth_interior_mask | neck_mask
-                    talking_dict['face_mask'] = complete_head_mask
-                    talking_dict['hair_mask'] = hair_mask
-                    face_mask_no_mouth = hair_mask | skin_mask | neck_mask
-                    talking_dict['face_mask_no_mouth'] = face_mask_no_mouth
-                    talking_dict['mouth_interior_mask'] = mouth_interior_mask
+                    # Bit-packed to cut preload RAM (byte-per-pixel bool masks are a
+                    # large share of the multi-scene CPU footprint); consumers unpack
+                    # via utils.mask_utils.unpack_bool_mask.
+                    talking_dict['face_mask'] = pack_bool_mask(complete_head_mask)
+                    talking_dict['hair_mask'] = pack_bool_mask(hair_mask)
                 else:
                     raise FileNotFoundError(f'Parsing mask not found: {mask_path}')
             if audio_file == '':
@@ -236,9 +236,12 @@ def readNerfSyntheticInfo(path, white_background, eval, extension='.jpg', args=N
     if not eval:
         print('Reading Training Transforms')
         train_cam_infos = readCamerasFromTransforms(path, 'transforms.json', white_background, extension, args.audio_file, args.audio_extractor, preload=preload, model_center=model_center)
-    print('Reading Evaluation Transforms')
-    test_cam_infos = readCamerasFromTransforms(path, 'transforms.json', white_background, extension, args.audio_file, args.audio_extractor, preload=preload, model_center=model_center)
-    if eval:
+        # Pretraining only consumes train cameras, so skip preloading a second copy
+        # of every frame as evaluation cameras (halves CPU RAM for data never used).
+        test_cam_infos = []
+    else:
+        print('Reading Evaluation Transforms')
+        test_cam_infos = readCamerasFromTransforms(path, 'transforms.json', white_background, extension, args.audio_file, args.audio_extractor, preload=preload, model_center=model_center)
         train_cam_infos = test_cam_infos
     nerf_normalization = getNerfppNorm(train_cam_infos)
     ply_path = os.path.join(path, 'points3D.ply')

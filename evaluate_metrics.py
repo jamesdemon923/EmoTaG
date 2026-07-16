@@ -114,6 +114,28 @@ class PSNRMeter:
         return f"PSNR: {self.measure():.6f}"
 
 
+class SSIMMeter:
+    def __init__(self, device: torch.device | None = None):
+        from utils.loss_utils import ssim as ssim_fn
+
+        self.value = 0.0
+        self.count = 0
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.fn = ssim_fn
+
+    def update(self, preds: torch.Tensor, truths: torch.Tensor) -> None:
+        pred = preds.permute(0, 3, 1, 2).contiguous().to(self.device)
+        truth = truths.permute(0, 3, 1, 2).contiguous().to(self.device)
+        self.value += self.fn(pred, truth).item()
+        self.count += 1
+
+    def measure(self) -> float:
+        return self.value / self.count
+
+    def report(self) -> str:
+        return f"SSIM: {self.measure():.6f}"
+
+
 class LPIPSMeter:
     def __init__(self, net: str = "alex", device: torch.device | None = None):
         import lpips
@@ -147,6 +169,7 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lmd_meter = LMDMeter(backend=backend)
     psnr_meter = PSNRMeter()
+    ssim_meter = SSIMMeter(device=device)
     lpips_meter = LPIPSMeter(device=device)
 
     rendered_capture = cv2.VideoCapture(rendered_video_path)
@@ -175,6 +198,7 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
             rendered = torch.FloatTensor(frame_rendered[..., ::-1] / 255.0)[None, ...].to(device)
             gt = torch.FloatTensor(frame_gt[..., ::-1] / 255.0)[None, ...].to(device)
             psnr_meter.update(rendered, gt)
+            ssim_meter.update(rendered, gt)
             lpips_meter.update(rendered, gt)
             try:
                 lmd_meter.update(rendered, gt)
@@ -196,6 +220,7 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
     results = {
         "LMD": lmd_meter.measure(),
         "PSNR": psnr_meter.measure(),
+        "SSIM": ssim_meter.measure(),
         "LPIPS": lpips_meter.measure(),
         "total_frames": float(processed),
         "failed_frames": float(failed_frames),
@@ -204,6 +229,7 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
 
     print(lmd_meter.report())
     print(psnr_meter.report())
+    print(ssim_meter.report())
     print(lpips_meter.report())
 
     metrics_path = os.path.join(output_dir, "metrics.txt")
@@ -217,6 +243,7 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
         file.write(f"LMD backend: {backend}\n")
         file.write(f"LMD: {results['LMD']:.6f}\n" if not np.isnan(results["LMD"]) else "LMD: unavailable\n")
         file.write(f"PSNR: {results['PSNR']:.6f}\n")
+        file.write(f"SSIM: {results['SSIM']:.6f}\n")
         file.write(f"LPIPS: {results['LPIPS']:.6f}\n")
     print(f"Metrics saved to: {metrics_path}")
     return results

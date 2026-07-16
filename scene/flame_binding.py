@@ -42,6 +42,16 @@ class FLAMEBinding(nn.Module):
         self.register_buffer('bary_coords', bary_coords.float().to(device))
         self.register_buffer('canonical_mesh_vertices', canonical_vertices.float().to(device))
         self.register_buffer('canonical_points', self.get_points_from_bary_coords(self.canonical_mesh_vertices))
+        # Per-face canonical frames (center/orientation/size); the canonical mesh is
+        # fixed, so these are computed once and reused by the local parameterization.
+        self._canonical_frames = None
+
+    def canonical_face_frames(self):
+        """(face_center [F,3], face_orien_mat [F,3,3], face_scaling [F,3]) on the canonical mesh."""
+        if self._canonical_frames is None:
+            from scene.flame_gaussian_model import compute_face_properties
+            self._canonical_frames = compute_face_properties(self.canonical_mesh_vertices, self.faces)
+        return self._canonical_frames
 
     def get_points_from_bary_coords(self, verts):
         """Helper function to compute point positions from vertices using barycentric coordinates."""

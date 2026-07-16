@@ -12,6 +12,7 @@ from gaussian_renderer import render, render_motion
 import sys, copy
 from scene_pretrain import Scene, GaussianModel, MotionNetwork
 from utils.general_utils import safe_state
+from utils.mask_utils import unpack_bool_mask
 import lpips
 import uuid
 from tqdm import tqdm
@@ -109,8 +110,8 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     opt.densify_until_iter = opt.iterations * len(data_list) * 0.85
     checkpoint_iterations = saving_iterations = [i * len(data_list) for i in range(0, opt.iterations + 1, 10000)] + [opt.iterations * len(data_list)]
     opt.iterations *= len(data_list)
-    transition_ratio = 0.1
-    curriculum_transition_iters = int(opt.iterations * transition_ratio)
+    transition_ratio = getattr(opt, 'curriculum_ratio', 0.1)
+    curriculum_transition_iters = max(1, int(opt.iterations * transition_ratio))
     curriculum_start_iter = warm_up_iter + 1
     curriculum_end_iter = curriculum_start_iter + curriculum_transition_iters
     first_iter = 0
@@ -142,6 +143,12 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         identity_path = os.path.join(_dataset.source_path, 'identity_feature.npy')
         if os.path.exists(identity_path):
             gaussians.identity_feature = torch.from_numpy(np.load(identity_path).reshape(-1)).float().cuda()
+        # Stable per-identity index selecting this identity's learnable code in render_motion.
+        gaussians.identity_index = data_list.index(data_name)
+        # Persist the index so downstream rendering (synthesize.py) selects the same
+        # per-identity code the scene was trained with.
+        with open(os.path.join(_dataset.model_path, 'identity_index.txt'), 'w') as f:
+            f.write(str(gaussians.identity_index))
         _dataset.model_center = model_center
         scene = Scene(_dataset, gaussians, debug_pre_binding=True)
         scene_list.append(scene)
@@ -166,6 +173,9 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     iter_end = torch.cuda.Event(enable_timing=True)
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    # Per-scene optimizer-step counters: densification/opacity-reset cadences are
+    # defined in per-scene steps (as in single-scene 3DGS), not global steps.
+    scene_own_steps = [0 for _ in scene_list]
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc='Training progress')
     first_iter += 1
     image_debugger = ImageDebugger(dataset.model_path, data_list, warm_up_iter, scene_paths)
@@ -178,6 +188,8 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         scene = scene_list[cur_scene_idx]
         gaussians = scene.gaussians
         current_scene_name = data_list[cur_scene_idx]
+        scene_own_steps[cur_scene_idx] += 1
+        cur_scene_own_step = scene_own_steps[cur_scene_idx]
         gaussians.update_learning_rate(iteration)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -187,8 +199,8 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         stats_tracker.record_training(current_scene_name, current_frame_id)
         if iteration - 1 == debug_from:
             pipe.debug = True
-        face_mask = torch.as_tensor(viewpoint_cam.talking_dict['face_mask']).cuda()
-        hair_mask = torch.as_tensor(viewpoint_cam.talking_dict['hair_mask']).cuda()
+        face_mask = torch.as_tensor(unpack_bool_mask(viewpoint_cam.talking_dict['face_mask'])).cuda()
+        hair_mask = torch.as_tensor(unpack_bool_mask(viewpoint_cam.talking_dict['hair_mask'])).cuda()
         head_mask = face_mask
         if iteration <= warm_up_iter:
             # Warm up the Gaussian avatar before enabling audio-driven motion.
@@ -202,7 +214,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
             radii = render_pkg['radii']
             gt_image_original = viewpoint_cam.original_image.cuda() / 255.0
             gt_image = gt_image_original * head_mask + background[:, None, None] * ~head_mask
-            lambda_ssim = 0.2
+            lambda_ssim = opt.lambda_dssim
             photo_l1_loss = l1_loss(rendered_image, gt_image)
             photo_ssim_loss = 1.0 - ssim(rendered_image, gt_image)
             loss = (1.0 - lambda_ssim) * photo_l1_loss + lambda_ssim * photo_ssim_loss
@@ -220,7 +232,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                 curriculum_weight = min(1.0, max(0.0, progress))
             if iteration % 100 == 0 or iteration == curriculum_start_iter:
                 print(f'Curriculum weight: {curriculum_weight:.4f}')
-            render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background, curriculum_weight=curriculum_weight)
+            render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background, curriculum_weight=curriculum_weight, drive_with_gt=True)
             rendered_image = render_pkg['render']
             alpha = render_pkg['alpha']
             viewspace_point_tensor = render_pkg['viewspace_points']
@@ -237,13 +249,27 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
             gt_jaw_flat = gt_jaw.squeeze()
             gt_image_original = viewpoint_cam.original_image.cuda() / 255.0
             gt_image = gt_image_original * head_mask + background[:, None, None] * ~head_mask
-            lambda_ssim = 0.2
+            lambda_ssim = opt.lambda_dssim
             photo_l1_loss = l1_loss(rendered_image, gt_image)
             photo_ssim_loss = 1.0 - ssim(rendered_image, gt_image)
             rendering_loss = (1.0 - lambda_ssim) * photo_l1_loss + lambda_ssim * photo_ssim_loss
+            # Mouth-crop supervision: the intra-oral region is a tiny fraction of the
+            # frame and gets almost no gradient share from full-frame losses; weight
+            # the lips_rect crop so the mouth branch/teeth learn real detail.
+            if getattr(opt, 'w_mouth_crop', 0) > 0:
+                _mx0, _mx1, _my0, _my1 = viewpoint_cam.talking_dict['lips_rect']
+                _mx0, _mx1 = max(0, int(_mx0)), min(rendered_image.shape[1], int(_mx1))
+                _my0, _my1 = max(0, int(_my0)), min(rendered_image.shape[2], int(_my1))
+                if _mx1 - _mx0 > 8 and _my1 - _my0 > 8:
+                    rendering_loss = rendering_loss + opt.w_mouth_crop * l1_loss(
+                        rendered_image[:, _mx0:_mx1, _my0:_my1], gt_image[:, _mx0:_mx1, _my0:_my1])
             flame_exp_loss = F.mse_loss(pred_exp_flat, gt_exp_flat)
             flame_jaw_loss = F.mse_loss(pred_jaw_flat, gt_jaw_flat)
-            flame_reg_loss = flame_exp_loss + flame_jaw_loss
+            # Jaw is THE lip-sync driver but its MSE (radians, ~1e-3) is drowned by the
+            # 50-dim expression MSE (~0.2-0.8); unweighted, the jaw regression tends to
+            # collapse toward the mean. Reweight so the jaw term matches the
+            # rendering-loss scale.
+            flame_reg_loss = flame_exp_loss + opt.w_jaw_reg * flame_jaw_loss
             w_rendering = 1.0
             w_flame_reg = opt.w_flame_reg
             loss = w_rendering * rendering_loss + w_flame_reg * flame_reg_loss
@@ -278,7 +304,17 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.05 + 0.25 * iteration / opt.densify_until_iter, scene.cameras_extent, size_threshold)
+                    # min_opacity must stay BELOW the opacity-reset value (0.01) or the reset
+                    # immediately mass-prunes every gaussian (-> 0 gaussians -> rasterizer crash).
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                # Standard 3DGS opacity reset, but counted in the scene's OWN optimizer
+                # steps. Resetting every scene on the global interval gives each scene only
+                # ~interval/len(scene_list) of its own steps to recover opacity before the
+                # next reset -> gaussians stay permanently translucent -> soft, washed-out
+                # renders. With per-scene counting each scene gets the full interval to
+                # re-justify its gaussians, exactly like single-scene 3DGS.
+                if cur_scene_own_step % opt.opacity_reset_interval == 0:
+                    gaussians.reset_opacity()
             if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 from utils.sh_utils import eval_sh
                 shs_view = gaussians.get_features.transpose(1, 2).view(-1, 3, (gaussians.max_sh_degree + 1) ** 2)
@@ -301,8 +337,8 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                 ckpt = (motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
                 torch.save(ckpt, dataset.model_path + '/chkpnt_face_latest' + '.pth')
                 with ema_motion_net.average_parameters():
-                    ckpt_ema = (motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
-                    torch.save(ckpt, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
+                    ckpt_ema = (copy.deepcopy(motion_net.state_dict()), motion_optimizer.state_dict(), iteration)
+                    torch.save(ckpt_ema, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
                 for _scene in scene_list:
                     _gaussians = _scene.gaussians
                     ckpt = (_gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
@@ -339,8 +375,8 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     ckpt = (motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
     torch.save(ckpt, dataset.model_path + '/chkpnt_face_latest' + '.pth')
     with ema_motion_net.average_parameters():
-        ckpt_ema = (motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
-        torch.save(ckpt, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
+        ckpt_ema = (copy.deepcopy(motion_net.state_dict()), motion_optimizer.state_dict(), iteration)
+        torch.save(ckpt_ema, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
     for _scene in scene_list:
         _gaussians = _scene.gaussians
         ckpt = (_gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
@@ -348,7 +384,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         torch.save(ckpt, _scene.model_path + '/chkpnt_face_latest' + '.pth')
     print('Final checkpoint saved successfully!')
     stats_tracker.save_final_report(iteration)
-    flame_debugger.generate_final_summary()
+    flame_debugger.generate_final_report()
 if __name__ == '__main__':
     parser = ArgumentParser(description='Training script parameters')
     lp = ModelParams(parser)

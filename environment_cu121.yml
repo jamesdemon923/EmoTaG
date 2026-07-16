@@ -17,6 +17,7 @@ dependencies:
   - openh264
   - mkl=2023.0
   - pip:
+      - ninja
       - numpy==1.24.3
       - pillow==9.5.0
       - scipy

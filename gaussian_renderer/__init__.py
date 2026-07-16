@@ -50,7 +50,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     rendered_image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(means3D=means3D, means2D=means2D, shs=shs, colors_precomp=colors_precomp, opacities=opacity, scales=scales, rotations=rotations, cov3Ds_precomp=cov3D_precomp, extra_attrs=torch.ones_like(opacity))
     return {'render': rendered_image, 'viewspace_points': screenspace_points, 'visibility_filter': radii > 0, 'depth': rendered_depth, 'alpha': rendered_alpha, 'normal': rendered_norm, 'radii': radii}
 
-def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, debug_viz=True, curriculum_weight=1.0):
+def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, debug_viz=True, curriculum_weight=1.0, drive_with_gt=False, drive_params=None, mouth_params=None, return_motion_only=False):
     """
     Render the scene using the new FLAME-driven architecture.
     """
@@ -63,17 +63,26 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     identity_feat = getattr(pc, 'identity_feature', None)
     if identity_feat is not None:
         identity_feat = identity_feat.cuda()
-    preds = motion_net(audio_feat, au=au_feat, identity=identity_feat)
+    # Per-identity learnable code: gives each pretrain identity dedicated capacity so
+    # the shared motion network is not forced to average across all of them.
+    ind_code = None
+    if getattr(motion_net, 'individual_dim', 0) > 0:
+        _idx = int(getattr(pc, 'identity_index', 0))
+        ind_code = motion_net.individual_codes[_idx:_idx + 1]
+    preds = motion_net(audio_feat, c=ind_code, au=au_feat, identity=identity_feat)
     pred_exp_raw = preds['flame_exp']
     pred_jaw_raw = preds['flame_jaw']
     if pred_exp_raw.dim() == 1:
         pred_exp_raw = pred_exp_raw.unsqueeze(0)
     if pred_jaw_raw.dim() == 1:
         pred_jaw_raw = pred_jaw_raw.unsqueeze(0)
+    # The audio window holds per-frame predictions for frames [t-4, t+4); use the
+    # center frame's prediction rather than averaging, which would low-pass the
+    # articulation timing. The encoder still attends over the whole window as context.
     if pred_exp_raw.shape[0] > 1:
-        pred_exp_raw = pred_exp_raw.mean(dim=0, keepdim=True)
+        pred_exp_raw = pred_exp_raw[pred_exp_raw.shape[0] // 2].unsqueeze(0)
     if pred_jaw_raw.shape[0] > 1:
-        pred_jaw_raw = pred_jaw_raw.mean(dim=0, keepdim=True)
+        pred_jaw_raw = pred_jaw_raw[pred_jaw_raw.shape[0] // 2].unsqueeze(0)
     encoded_audio_feat = preds.get('encoded_audio', None)
     pred_exp = pred_exp_raw * curriculum_weight
     pred_jaw = pred_jaw_raw * curriculum_weight
@@ -86,8 +95,29 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     if gt_pose.dim() == 1:
         gt_pose = gt_pose.unsqueeze(0)
     gt_global_rot = gt_pose[:, :3]
-    final_pose = torch.cat([gt_global_rot, pred_jaw], dim=1)
-    flame_verts = pc.flame_wrapper.get_flame_vertices(frame_id, motion_expression=pred_exp, motion_jaw_pose=pred_jaw)
+    if drive_with_gt:
+        # Appearance optimization uses the tracked FLAME parameters so the deformed
+        # geometry is aligned with the target frame; the motion network still trains
+        # through the parameter-regression / SEG losses computed from `preds` above.
+        # Driving the photometric loss with the (imperfect) predicted parameters
+        # supervises the gaussians through misaligned geometry every step, and the
+        # optimum of that objective is a motion-blurred average texture.
+        drive_exp = gt_exp_feat[:, :50]
+        drive_jaw = gt_pose[:, 3:]
+    elif drive_params is not None:
+        # Externally supplied (e.g. temporally smoothed) expression/jaw: inference
+        # smooths the per-frame predictions over time to suppress frame-to-frame
+        # parameter tremor without touching articulation timing.
+        drive_exp, drive_jaw = drive_params
+        if drive_exp.dim() == 1:
+            drive_exp = drive_exp.unsqueeze(0)
+        if drive_jaw.dim() == 1:
+            drive_jaw = drive_jaw.unsqueeze(0)
+    else:
+        drive_exp = pred_exp
+        drive_jaw = pred_jaw
+    final_pose = torch.cat([gt_global_rot, drive_jaw], dim=1)
+    flame_verts = pc.flame_wrapper.get_flame_vertices(frame_id, motion_expression=drive_exp, motion_jaw_pose=drive_jaw)
     canonical_xyz = pc.get_canonical_xyz
     canonical_scales = pc.get_scaling
     canonical_rotations = pc.get_rotation
@@ -107,7 +137,16 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     mouth_pred = None
     mouth_mask = getattr(pc, 'mouth_mask', None)
     if mouth_mask is not None and mouth_mask.numel() == means3D.shape[0] and mouth_mask.any():
-        mouth_pred = motion_net.forward_mouth(xyz=means3D, a=audio_feat, mouth_mask=mouth_mask, encoded_audio=encoded_audio_feat)
+        if mouth_params is not None:
+            # Externally supplied (e.g. temporally smoothed) intra-oral deltas: the
+            # triplane branch predicts them per frame from audio, so they carry the
+            # same frame-to-frame tremor as the expression head.
+            mouth_pred = mouth_params
+        else:
+            mouth_pred = motion_net.forward_mouth(xyz=means3D, a=audio_feat, mouth_mask=mouth_mask, c=ind_code, encoded_audio=encoded_audio_feat)
+        if return_motion_only:
+            return {'predicted_flame_exp': pred_exp, 'predicted_flame_jaw': pred_jaw,
+                    'mouth_pred': ({k: v.detach() for k, v in mouth_pred.items()} if mouth_pred is not None else None)}
         if mouth_pred is not None and mouth_pred['d_mu'].numel() > 0:
             means3D = means3D.clone()
             rotations = rotations.clone()
@@ -131,6 +170,9 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
             rotations[mouth_mask] = composed_rotations
             mouth_scale_delta = pc.scaling_activation(weighted_d_scale)
             scales[mouth_mask] = scales[mouth_mask] * mouth_scale_delta
+    if return_motion_only:
+        # Scene without an intra-oral subset: nothing further to collect.
+        return {'predicted_flame_exp': pred_exp, 'predicted_flame_jaw': pred_jaw, 'mouth_pred': None}
     screenspace_points = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device='cuda') + 0
     if screenspace_points.requires_grad:
         try:

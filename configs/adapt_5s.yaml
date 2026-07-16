@@ -1,0 +1,33 @@
+# EmoTaG few-shot adaptation configuration (single identity, ~5s clip).
+#
+# Loads the pre-trained EMA motion network and adapts only the AdaIN layers
+# (--adapt_adain_only) plus the per-scene Gaussians to a new identity. The entry
+# point is adapt_emotag.py; scripts/adapt.sh reads the same defaults.
+
+data:
+  source_path: data/<ID>       # -s : one processed identity scene
+  audio_extractor: wav2vec2
+  N_views: 125                 # ~5s @25fps; use -1 to use all frames
+
+optimization:
+  iterations: 20000            # paper budget for adaptation
+  warm_up_iter: 1000           # static appearance only during warmup
+  lambda_dssim: 0.2
+  gaussian_lr: 0.005
+  motion_net_lr: 0.0005        # adapt lr_net (higher than pretrain; only AdaIN trains)
+  adapt_adain_only: true       # freeze everything except AdaIN (freeze_for_adaptation)
+  # Sapiens geometry priors ON for adaptation (needs sapiens/{depth,normal}):
+  w_geo_depth: 0.01            # λ_D
+  w_geo_normal: 0.001          # λ_N
+
+misc:
+  seed: 0
+  sh_degree: 1
+
+# Reference command:
+#   CUDA_VISIBLE_DEVICES=0 python adapt_emotag.py \
+#     -s data/<ID> -m output/adapt/<ID> --audio_extractor wav2vec2 \
+#     --pretrain_path output/pretrain/chkpnt_ema_face_latest.pth \
+#     --iterations 20000 --warm_up_iter 1000 --adapt_adain_only \
+#     --sh_degree 1 --N_views 125
+# Output: output/adapt/<ID>/chkpnt_face_latest.pth

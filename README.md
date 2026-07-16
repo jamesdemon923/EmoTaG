@@ -35,10 +35,23 @@ conda activate emotag
 
 ```bash
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
-pip install -e submodules/diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 pip install -e gridencoder
 pip install -e shencoder
+```
+
+EmoTaG's renderer requires the depth/normal/alpha-capable rasterizer
+[`slothfulxtx/diff-gaussian-rasterization`](https://github.com/slothfulxtx/diff-gaussian-rasterization)
+(installed as the **`diff_gauss`** package). The bundled
+`submodules/diff-gaussian-rasterization` is the vanilla INRIA rasterizer and is
+**not** used by EmoTaG. Install `diff_gauss` with:
+
+```bash
+git clone --recurse-submodules https://github.com/slothfulxtx/diff-gaussian-rasterization.git
+cd diff-gaussian-rasterization
+python setup.py install
+cd ..
+python -c "import diff_gauss; print('diff_gauss OK')"
 ```
 
 ### 3. Third-party resources
@@ -48,9 +61,9 @@ pip install -e shencoder
 | [FLAME](https://flame.is.tue.mpg.de/index.html) | FLAME parametric head model |
 | [VHAP](https://github.com/ShenhanQian/VHAP) | FLAME tracking environment |
 | [Wav2Vec2](https://huggingface.co/facebook/wav2vec2-base-960h) | Audio feature extraction backbone |
-| [OpenFace](https://github.com/TadasBaltrusaitis/OpenFace) | Action Unit (AU) feature extraction |
+| [py-feat](https://py-feat.org/) | Action Unit (AU) feature extraction |
 | [DeepFace](https://github.com/serengil/deepface) | Per-frame emotion features |
-| [AdaFace](https://github.com/mk-minchul/adaface) | Identity embedding |
+| [CVLface](https://github.com/mk-minchul/CVLface) | Identity embedding |
 | [Sapiens](https://github.com/facebookresearch/sapiens/blob/main/lite/README.md) | Depth and normal priors for adaptation |
 
 Export the FLAME / VHAP paths used by the preprocessing tools:
@@ -79,7 +92,21 @@ respective licenses. All clips are face-centered cropped and resized to
 
 ## Data Preparation
 
-EmoTaG operates on a **processed scene** containing calibrated images, FLAME tracking, Gaussian initialization, audio features, AU features, the DeepFace emotion teacher, and the AdaFace identity descriptor.
+EmoTaG operates on a **processed scene** containing calibrated images, FLAME tracking, Gaussian initialization, audio features, AU features, the DeepFace emotion teacher, and the identity descriptor.
+
+> **One command:** after running VHAP tracking, `tools/preprocess_scene.sh`
+> chains all of the steps below for a single scene. The per-step instructions
+> that follow document what each stage produces.
+>
+> ```bash
+> EMOTAG_FLAME_MODEL=/path/to/FLAME/generic_model.pkl \
+> VHAP_EXPORT=/path/to/VHAP/export/monocular/<ID>_whiteBg_staticOffset \
+> WAV=data/<ID>/aud.wav \
+> CVLFACE_ROOT=/path/to/CVLface \
+> bash tools/preprocess_scene.sh data/<ID>
+> # add RUN_SAPIENS=1 for adaptation (target) scenes
+> # per-tool conda interpreters can be overridden with AU_PY / DEEPFACE_PY / ADAFACE_PY
+> ```
 
 <details>
 <summary><b>Expected directory layout</b></summary>
@@ -120,6 +147,21 @@ python tools/import_vhap_export.py \
   --link_mode  symlink
 ```
 
+### Step 1b — Facial landmarks (FAN)
+
+The dataset readers use per-frame 68-point landmarks (`ori_imgs/<id>.lms`) to
+derive the lip / mouth crops that supervise the mouth Gaussians. Extract real
+landmarks with the FAN detector:
+
+```bash
+python tools/extract_landmarks.py --scene data/<ID>
+# -> data/<ID>/ori_imgs/<id>.lms   shape [68, 2]
+```
+
+> `import_vhap_export.py` no longer writes landmarks by default. Its
+> `--use_fallback_landmarks` flag only emits coarse synthetic landmarks for
+> smoke tests and must not be used for reproduction.
+
 ### Step 2 — Audio features (Wav2Vec2)
 
 ```bash
@@ -129,13 +171,20 @@ python tools/extract_wav2vec2_features.py \
   --transforms data/<ID>/transforms.json
 ```
 
-### Step 3 — AU features (OpenFace)
+### Step 3 — AU features (py-feat)
 
-Run `FeatureExtraction` from OpenFace and place the CSV under the scene folder. The six AU channels (`AU01, AU04, AU05, AU06, AU07, AU45`) supply the upper-face expression cues that audio cannot carry:
+The six AU channels (`AU01, AU04, AU05, AU06, AU07, AU45`) supply the upper-face
+expression cues that audio cannot carry (`AU45` is clipped to `[0, 2]` at load
+time, following Supp. Sec. B.2). Extract them with [py-feat](https://py-feat.org/):
 
 ```bash
-mv /path/to/openface_output.csv data/<ID>/au_features.csv
+python tools/extract_pyfeat_au.py --scene data/<ID>
+# -> data/<ID>/au_features.csv
 ```
+
+> An OpenFace-based alternative wrapper (`tools/extract_openface_au.sh`, needs a
+> local OpenFace build via `OPENFACE_BIN`) is also provided; the released
+> checkpoint was trained with the py-feat features above.
 
 ### Step 4 — Emotion teacher (DeepFace)
 
@@ -148,17 +197,18 @@ python tools/extract_deepface_emotion.py --scene data/<ID>
 #    columns = [angry, disgust, fear, happy, sad, surprise, neutral]
 ```
 
-### Step 5 — Identity descriptor (AdaFace)
+### Step 5 — Identity descriptor (CVLface)
 
-Compute the identity descriptor `s` as the average
-[AdaFace](https://github.com/mk-minchul/adaface) embedding over the top-50
-neutral frames (run Step 4 first so neutral frames can be ranked):
+Compute the identity descriptor `s` as the average face-recognition embedding
+over the top-50 neutral frames (run Step 4 first so neutral frames can be
+ranked). The extractor uses a [CVLface](https://github.com/mk-minchul/CVLface)
+model; clone CVLface and point `--cvlface_root` at it (its pretrained models are
+fetched under `<cvlface_root>/cvlface/pretrained_models`):
 
 ```bash
 python tools/extract_adaface_identity.py \
-  --scene        data/<ID> \
-  --adaface_repo /path/to/adaface \
-  --adaface_ckpt /path/to/adaface_ir101_webface12m.ckpt
+  --scene         data/<ID> \
+  --cvlface_root  /path/to/CVLface
 # -> data/<ID>/identity_feature.npy   shape [512]
 ```
 
@@ -197,11 +247,28 @@ The checker reports whether each required scene file is present and valid.
 python pretrain_emotag.py \
   -s data/pretrain \
   -m output/pretrain \
-  --scene_names <ID_1>,<ID_2> \
+  --scene_names_file data/hdtf_pretrain_ids.txt \
   --audio_extractor wav2vec2 \
-  --iterations 30000 \
+  --iterations 3600 \
+  --warm_up_iter_per_scene 1000 \
+  --w_flame_reg 1.0 \
   --batch_size 1
 ```
+
+> `data/hdtf_pretrain_ids.txt` lists the 70 HDTF identities (one clip each,
+> 90–240 s) used for the universal motion prior; point `-s` at the directory
+> that contains those processed scenes. **`--iterations` is PER SCENE**:
+> `pretrain_emotag.py` multiplies it by the number of scenes internally, so
+> `--iterations 3600` over the 70 HDTF ids gives ~250K total optimiser steps
+> (the paper budget). For a quick smoke run use a small value (e.g.
+> `--iterations 60`). These canonical hyper-parameters are documented in
+> [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml). The
+> multi-identity EMA checkpoint is written to
+> `output/pretrain/chkpnt_ema_face_latest.pth` for adaptation.
+>
+> **Multi-GPU:** `pretrain_emotag_ddp.py` runs the same pre-training across
+> several GPUs (scenes are sharded across ranks), e.g.
+> `torchrun --nproc_per_node=<N> pretrain_emotag_ddp.py <same args>`.
 
 ### Few-shot adaptation (target identity)
 
@@ -210,14 +277,48 @@ python adapt_emotag.py \
   -s data/<ID> \
   -m output/<ID> \
   --audio_extractor wav2vec2 \
-  --pretrain_path output/pretrain/<ID_1>/chkpnt_ema_face_latest.pth \
+  --pretrain_path output/pretrain/chkpnt_ema_face_latest.pth \
   --iterations 20000 \
   --N_views 125 \
   --adapt_adain_only          
 ```
 
 > `--adapt_adain_only` freezes the pretrained GRMN and tunes only the AdaIN
-> modulation parameters.
+> modulation parameters. Optionally add `--adapt_unfreeze_heads` to also
+> fine-tune the small FLAME/mouth prediction heads for identity-specific
+> articulation. The canonical adaptation hyper-parameters are in
+> [`configs/adapt_5s.yaml`](configs/adapt_5s.yaml).
+>
+> **Checkpoint to use:** few-shot adaptation expects the multi-identity
+> **EMA / motion-only** checkpoint saved at the pre-training output **root**,
+> i.e. `output/pretrain/chkpnt_ema_face_latest.pth` (a 3-tuple
+> `(motion_state, optimizer_state, iter)`). The per-identity
+> `output/pretrain/<ID>/chkpnt_face_latest.pth` files are 4-tuples that also
+> bundle the Gaussian model and are **not** the right input here (the loader now
+> handles both, but the EMA checkpoint is recommended).
+
+### Pretrained checkpoint
+
+We release the multi-identity EMA motion-prior checkpoint so you can skip the
+compute-heavy pre-training and go straight to few-shot adaptation.
+
+| File | Contents | Use |
+| :--- | :--- | :--- |
+| `chkpnt_ema_face_latest.pth` | 3-tuple `(motion_state, optimizer_state, iter)` — the GRMN motion network (EMA weights), no per-identity Gaussians | `--pretrain_path` for `adapt_emotag.py` |
+
+```bash
+# download the released checkpoint, then adapt to your identity
+python adapt_emotag.py -s data/<ID> -m output/<ID> \
+  --audio_extractor wav2vec2 \
+  --pretrain_path /path/to/chkpnt_ema_face_latest.pth \
+  --iterations 20000 --N_views 125 --adapt_adain_only
+```
+
+> **Download:** [Google Drive](https://drive.google.com/drive/folders/17wgFUGF7pxbW3QlBkiHQzo3nYTzF-fiN?usp=drive_link)
+>
+> **Provenance:** the multi-identity GRMN motion prior is trained on HDTF
+> identities (see [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt)) with
+> the recipe in [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
 
 ---
 
@@ -245,12 +346,16 @@ python evaluate_metrics.py video \
   output/<ID>/train
 ```
 
-### Action-Unit metrics
+### Action-Unit metrics (optional)
+
+The AU error (AUE) compares AU intensities between the rendered and the
+ground-truth videos. First run an AU extractor (see Step 3) on the **frames of
+each video** to produce two CSVs, then:
 
 ```bash
 python evaluate_metrics.py au \
-  output/<ID>/train/rendered_openface.csv \
-  output/<ID>/train/gt_openface.csv \
+  output/<ID>/train/rendered_au.csv \
+  output/<ID>/train/gt_au.csv \
   --output_dir output/<ID>/train
 ```
 
@@ -260,7 +365,7 @@ This code is developed upon [InsTaG](https://github.com/Fictionarry/InsTaG) and
 [GaussianAvatars](https://github.com/ShenhanQian/GaussianAvatars). FLAME tracking
 is from [VHAP](https://github.com/ShenhanQian/VHAP). Emotion and identity features
 are obtained from [DeepFace](https://github.com/serengil/deepface) and
-[AdaFace](https://github.com/mk-minchul/adaface). Geometry priors are from
+[CVLface](https://github.com/mk-minchul/CVLface). Geometry priors are from
 [Sapiens](https://github.com/facebookresearch/sapiens). Thanks for these great projects!
 
 ---

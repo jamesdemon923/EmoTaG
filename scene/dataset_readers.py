@@ -15,6 +15,7 @@ from utils.sh_utils import SH2RGB
 from utils.audio_utils import get_audio_features
 from utils.au_utils import load_openface_au_csv
 from utils.emotion_utils import load_emotion_features, emotion_score_from_distribution
+from utils.mask_utils import pack_bool_mask
 from scene.gaussian_model import BasicPointCloud
 
 class CameraInfo(NamedTuple):
@@ -152,9 +153,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             cam_name = os.path.join(path, 'gt_imgs', str(img_id) + extension)
             c2w = np.array(frame['transform_matrix'])
             c2w[:3, 1:3] *= -1
-            c2w[:3, 3] *= 1 / 2.4
-            if model_center is not None:
-                c2w[:3, 3] += model_center
+            # Use the VHAP-exported camera as-is: the exported (camera, focal) pair is
+            # what projects the tracked FLAME mesh onto the GT pixels. Do not rescale
+            # the translation or shift by model_center here, which would break that
+            # projective consistency.
             w2c = np.linalg.inv(c2w)
             R = np.transpose(w2c[:3, :3])
             T = w2c[:3, 3]
@@ -190,11 +192,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                     mouth_interior_mask = (mask[:, :, 0] == 100) & (mask[:, :, 1] == 100) & (mask[:, :, 2] == 100)
                     neck_mask = (mask[:, :, 0] == 0) & (mask[:, :, 1] == 255) & (mask[:, :, 2] == 0)
                     complete_head_mask = hair_mask | skin_mask | mouth_interior_mask | neck_mask
-                    talking_dict['face_mask'] = complete_head_mask
-                    talking_dict['hair_mask'] = hair_mask
-                    face_mask_no_mouth = hair_mask | skin_mask | neck_mask
-                    talking_dict['face_mask_no_mouth'] = face_mask_no_mouth
-                    talking_dict['mouth_interior_mask'] = mouth_interior_mask
+                    # Bit-packed to cut preload RAM (byte-per-pixel bool masks are a
+                    # large share of the multi-scene CPU footprint); consumers unpack
+                    # via utils.mask_utils.unpack_bool_mask.
+                    talking_dict['face_mask'] = pack_bool_mask(complete_head_mask)
+                    talking_dict['hair_mask'] = pack_bool_mask(hair_mask)
                 else:
                     raise FileNotFoundError(f'Parsing mask not found: {mask_path}')
             if audio_file == '':
@@ -226,7 +228,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             talking_dict['lhalf_rect'] = ldmks_lhalf[idx]
             talking_dict['mouth_bound'] = [mouth_lb, mouth_ub, ldmks_mouth[idx, 1] - ldmks_mouth[idx, 0]]
             talking_dict['img_id'] = img_id
-            if 'train' in transformsfile and N_views > 0:
+            if N_views > 0:  # few-shot train load: attach Sapiens depth/normal priors. (Was gated on "train" in the filename, but EmoTaG uses transforms.json, so the priors never loaded and the geometric loss was always skipped.)
                 normal_path_candidates = glob.glob(os.path.join(path, 'sapiens/normal/sapiens_*'))
                 normal_path_candidates.sort(reverse=True)
                 normal_path = os.path.join(normal_path_candidates[0], str(img_id) + '.npy')

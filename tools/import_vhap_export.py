@@ -176,8 +176,12 @@ def write_scene_files(args: argparse.Namespace) -> None:
         gt_path = output_root / 'gt_imgs' / f'{frame_id}.jpg'
         link_or_copy(image_path, ori_path, args.link_mode)
         link_or_copy(image_path, gt_path, args.link_mode)
-        landmarks = make_fallback_landmarks(width, height)
-        np.savetxt(output_root / 'ori_imgs' / f'{frame_id}.lms', landmarks, fmt='%.6f')
+        if args.use_fallback_landmarks:
+            # Coarse synthetic landmarks for pipeline testing only. They are identical
+            # across frames and will collapse mouth supervision -- never use for
+            # reproduction. Run tools/extract_landmarks.py for real FAN landmarks.
+            landmarks = make_fallback_landmarks(width, height)
+            np.savetxt(output_root / 'ori_imgs' / f'{frame_id}.lms', landmarks, fmt='%.6f')
         make_parsing_mask(image_path=image_path, fg_mask_path=frame_mask_path(vhap_root, frame), output_path=output_root / 'parsing' / f'{frame_id}.png')
         make_transparent_torso(width, height, output_root / 'torso_imgs' / f'{frame_id}.png')
     if first_image_path is None:
@@ -205,11 +209,17 @@ def main() -> int:
     parser.add_argument('--audio_features', type=Path, default=None)
     parser.add_argument('--audio_dim', type=int, default=768)
     parser.add_argument('--audio_output', type=str, default='aud_w2v.npy')
+    parser.add_argument('--use_fallback_landmarks', action='store_true',
+                        help='Write coarse synthetic .lms files for pipeline testing only. '
+                             'For reproduction, leave this off and run tools/extract_landmarks.py.')
     args = parser.parse_args()
     if args.flame_model_path is None:
         parser.error('--flame_model_path is required unless EMOTAG_FLAME_MODEL is set.')
     write_scene_files(args)
     print(f'Imported VHAP scene to: {args.output}')
+    if not args.use_fallback_landmarks:
+        print('[next] Real landmarks were NOT written. Run:')
+        print(f'  python tools/extract_landmarks.py --scene {args.output}')
     return 0
 if __name__ == '__main__':
     raise SystemExit(main())

@@ -26,6 +26,19 @@ except ImportError as e:
     print(f'Failed to import VHAP FlameHead. Set EMOTAG_VHAP_ROOT or install VHAP. Error: {e}')
     sys.exit(1)
 
+def resolve_flame_npz(data_root: str, frame_id: int) -> str:
+    """Resolve a per-frame FLAME .npz, tolerating zero-padded VHAP exports.
+
+    VHAP exports frames as e.g. ``00000.npz`` while the packed parameters are
+    keyed by the unpadded integer id. Try the common namings before failing.
+    """
+    candidates = [f'{frame_id}.npz', f'{frame_id:05d}.npz', f'{frame_id:04d}.npz', f'{frame_id:06d}.npz']
+    for name in candidates:
+        path = os.path.join(data_root, name)
+        if os.path.exists(path):
+            return path
+    return os.path.join(data_root, f'{frame_id}.npz')
+
 def storePly(path, xyz, rgb):
     import numpy as np
     from plyfile import PlyData, PlyElement
@@ -65,8 +78,7 @@ class FlameDataProcessor:
         """
         Loads all available FLAME parameters for a specific frame from a .npz file.
         """
-        frame_name = f'{frame_id}.npz'
-        npz_path = os.path.join(data_root, frame_name)
+        npz_path = resolve_flame_npz(data_root, frame_id)
         if not os.path.exists(npz_path):
             raise FileNotFoundError(f'FLAME parameter file not found: {npz_path}')
         data = np.load(npz_path)
@@ -366,8 +378,7 @@ class FlameDataProcessor:
         Generates a canonical model at real-world scale without any additional scaling.
         Scaling is now handled by camera extrinsics in dataset_readers.py.
         """
-        frame_name = f'{frame_id}.npz'
-        npz_path = os.path.join(data_root, frame_name)
+        npz_path = resolve_flame_npz(data_root, frame_id)
         if not os.path.exists(npz_path):
             raise FileNotFoundError(f'FLAME parameter file not found: {npz_path}')
         flame_params = self.load_flame_params(data_root, frame_id)

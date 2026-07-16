@@ -35,7 +35,7 @@ BATCH_SIZE=1
 
 # Find all images and sort them, then write to a temporary text file
 IMAGE_LIST="${INPUT}/image_list.txt"
-find "${INPUT}" -type f \( -iname \*.jpg -o -iname \*.png \) | sort -V | head -n $N_VALID > "${IMAGE_LIST}"
+find -L "${INPUT}" -type f \( -iname \*.jpg -o -iname \*.png \) | sort -V | head -n $N_VALID > "${IMAGE_LIST}"
 
 # Check if image list was created successfully
 if [ ! -s "${IMAGE_LIST}" ]; then

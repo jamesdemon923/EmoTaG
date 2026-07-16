@@ -1,0 +1,45 @@
+# EmoTaG pre-training configuration (HDTF, 70 identities).
+#
+# These are the canonical hyper-parameters used to pre-train the GRMN motion
+# network. The training entry point is argparse-based (pretrain_emotag.py); this
+# file documents the values so a run is reproducible. scripts/pretrain.sh reads
+# the same defaults (override via env vars shown in comments).
+#
+# IMPORTANT (per-scene iteration semantics):
+#   pretrain_emotag.py does `opt.iterations *= len(data_list)` internally, so the
+#   --iterations flag is PER SCENE. With 70 scenes, --iterations 3600 gives
+#   ~250K total optimiser steps (the paper's budget). For a quick smoke run use a
+#   small value (e.g. 60). Pick whichever matches your compute.
+
+data:
+  source_path: data            # -s : root containing one folder per identity
+  scene_names_file: data/hdtf_pretrain_ids.txt   # 70 HDTF identities
+  audio_extractor: wav2vec2    # facebook/wav2vec2-base-960h, 768-d, 16 frames/window
+  num_points: 60000            # initial Gaussians sampled on the FLAME mesh
+
+optimization:
+  iterations_per_scene: 3600   # ~250K total over 70 scenes (paper budget)
+  warm_up_iter_per_scene: 1000 # static appearance only during warmup
+  batch_size: 1
+  lambda_dssim: 0.2            # photometric L = (1-λ)L1 + λ(1-SSIM)
+  # motion network learning rates (scene/motion_net.get_params(lr, lr_net)):
+  gaussian_lr: 0.005           # lr  : hashgrid/triplane encoders
+  motion_net_lr: 0.00005       # lr_net : transformer / heads / AdaIN
+  w_flame_reg: 1.0             # MSE between predicted and VHAP-tracked FLAME params
+  w_emotion_kl: 0.01           # L_KL  (DeepFace emotion distillation)
+  w_emotion_score: 0.1         # L_Score
+  # geometry priors are off for pre-training (Sapiens used only in adaptation):
+  w_geo_depth: 0.0
+  w_geo_normal: 0.0
+
+misc:
+  seed: 0                       # utils/general_utils.safe_state
+  sh_degree: 1
+
+# Reference command:
+#   CUDA_VISIBLE_DEVICES=0 python pretrain_emotag.py \
+#     -s data -m output/pretrain --audio_extractor wav2vec2 \
+#     --scene_names_file data/hdtf_pretrain_ids.txt \
+#     --iterations 3600 --warm_up_iter_per_scene 1000 \
+#     --w_flame_reg 1.0 --batch_size 1 --sh_degree 1
+# Output: output/pretrain/chkpnt_ema_face_latest.pth  (3-tuple EMA motion net)

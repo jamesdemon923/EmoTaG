@@ -24,8 +24,7 @@ tensorboard_3d
 screenshots
 
 # Data and output directories
-data/*
-output/*
+data/**
 !*.gitkeep
 
 # Package installations and archives
@@ -42,7 +41,6 @@ mmcv-full-*/
 Thumbs.db
 
 # Logs and temporary files
-*.log
 *.tmp
 *.temp
 .cache/
@@ -57,3 +55,10 @@ Thumbs.db
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Release: results and per-scene data are not published (only manifests + code)
+output/
+data/*/
+!data/*.txt
+data_smoke/
+*.log

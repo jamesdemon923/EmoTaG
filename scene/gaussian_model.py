@@ -54,6 +54,21 @@ class GaussianModel:
         self.setup_functions()
         self.mouth_mask = None
         self.mouth_indices = None
+        # When True, the intra-oral gaussian subset is kept near its small
+        # anatomically-initialized size during densify/prune. Left unconstrained, the
+        # audio-driven mouth gaussians attract densification and can grow to dominate
+        # the head, degrading generalization to unseen frames.
+        self.freeze_mouth_set = False
+        # Max allowed size of the intra-oral set when freeze_mouth_set is on
+        # (None = hard freeze at the current count).
+        self.mouth_budget = None
+
+    def _mouth_growth_blocked(self):
+        if not self.freeze_mouth_set or self.mouth_mask is None:
+            return False
+        if self.mouth_budget is None:
+            return True
+        return int(self.mouth_mask.sum().item()) >= int(self.mouth_budget)
 
     def set_mouth_mask(self, mask: torch.Tensor, indices: torch.Tensor=None):
         """
@@ -91,10 +106,27 @@ class GaussianModel:
         return torch.nonzero(self.mouth_mask, as_tuple=False).flatten().long().to(self._xyz.device)
 
     def capture(self):
-        return (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest, self._scaling, self._rotation, self._opacity, self.max_radii2D, self.xyz_gradient_accum, self.denom, self.optimizer.state_dict(), self.spatial_lr_scale, self.neural_renderer.state_dict(), self.neural_motion_grid.state_dict() if self.neural_motion_grid is not None else None)
+        # Densification grows the FLAME binding (face_indices/bary_coords) in lockstep
+        # with _xyz. Persist it so restore() can rebuild a binding that matches the
+        # (possibly densified) gaussian count; otherwise get_canonical_xyz mismatches
+        # the freshly re-initialised 60k binding. Appended last for backward compat.
+        binding_state = None
+        if self.flame_binding is not None:
+            binding_state = (self.flame_binding.face_indices.detach().cpu(),
+                             self.flame_binding.bary_coords.detach().cpu())
+        # Densification permutes and grows the gaussian set, so the on-disk
+        # mouth_point_indices.npy does not identify the mouth gaussians after training.
+        # Persist the live mask so downstream rendering drives the mouth branch on the
+        # correct gaussians.
+        mouth_state = self.mouth_mask.detach().cpu() if self.mouth_mask is not None else None
+        return (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest, self._scaling, self._rotation, self._opacity, self.max_radii2D, self.xyz_gradient_accum, self.denom, self.optimizer.state_dict(), self.spatial_lr_scale, self.neural_renderer.state_dict(), self.neural_motion_grid.state_dict() if self.neural_motion_grid is not None else None, binding_state, mouth_state)
 
     def restore(self, model_args, training_args):
-        self.active_sh_degree, self._xyz, self._features_dc, self._features_rest, self._scaling, self._rotation, self._opacity, self.max_radii2D, xyz_gradient_accum, denom, opt_dict, self.spatial_lr_scale, neural_renderer_state, neural_motion_grid_state = model_args
+        # Old checkpoints have 14 elements; new ones append binding_state. Unpack the
+        # fixed prefix and treat the binding as optional.
+        (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest, self._scaling,
+         self._rotation, self._opacity, self.max_radii2D, xyz_gradient_accum, denom, opt_dict,
+         self.spatial_lr_scale, neural_renderer_state, neural_motion_grid_state, *rest) = model_args
         if neural_renderer_state is not None:
             self.neural_renderer = GridRenderer()
             self.neural_renderer.recover_from_ckpt(neural_renderer_state)
@@ -104,6 +136,23 @@ class GaussianModel:
             self.optimizer.load_state_dict(opt_dict)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        # Restore the densified FLAME binding so it matches the restored gaussian count.
+        binding_state = rest[0] if len(rest) > 0 else None
+        if binding_state is not None and self.flame_binding is not None:
+            face_indices, bary_coords = binding_state
+            dev = self.flame_binding.canonical_mesh_vertices.device
+            self.flame_binding.face_indices = face_indices.long().to(dev)
+            self.flame_binding.bary_coords = bary_coords.float().to(dev)
+            self.flame_binding._update_canonical_points()
+        elif self.flame_binding is not None and self._xyz.shape[0] != self.flame_binding.face_indices.shape[0]:
+            print(f"[restore] WARNING: gaussian count ({self._xyz.shape[0]}) != binding count "
+                  f"({self.flame_binding.face_indices.shape[0]}); checkpoint predates the binding fix "
+                  f"and cannot be rendered. Re-train to produce a compatible checkpoint.")
+        # Restore the (densification-tracked) mouth mask; older checkpoints lack it.
+        mouth_state = rest[1] if len(rest) > 1 else None
+        if mouth_state is not None:
+            self.mouth_mask = mouth_state.bool().to(self._xyz.device)
+            self.mouth_indices = self._recompute_mouth_indices_from_mask()
 
     def get_deformed_gaussians(self, flame_verts, flame_pose=None):
         """Internal helper."""
@@ -113,19 +162,62 @@ class GaussianModel:
 
     @property
     def get_scaling(self):
-        return self.scaling_activation(self._scaling)
+        from scene.flame_gaussian_model import binding_mode
+        if self.flame_binding is None or binding_mode() == 'hybrid':
+            return self.scaling_activation(self._scaling)
+        _, _, scaling = self._canonical_frame_per_point()
+        return self.scaling_activation(self._scaling) * scaling
+
+    # ------------------------------------------------------------------
+    # Triangle-local parameterization (paper Eq.7 / GaussianAvatars):
+    # _xyz/_rotation/_scaling are stored in the parent triangle's local frame;
+    # the world-space accessors below evaluate them on the CANONICAL mesh.
+    # get_deformed_gaussians evaluates the same mapping on a deformed mesh.
+    # ------------------------------------------------------------------
+    def _canonical_frame_per_point(self):
+        center, orien, scaling = self.flame_binding.canonical_face_frames()
+        fi = self.flame_binding.face_indices
+        return center[fi], orien[fi], scaling[fi]
 
     @property
     def get_rotation(self):
-        return self.rotation_activation(self._rotation)
+        from scene.flame_gaussian_model import binding_mode, matrix_to_quaternion, quaternion_multiply
+        if self.flame_binding is None or binding_mode() == 'hybrid':
+            return self.rotation_activation(self._rotation)
+        _, orien, _ = self._canonical_frame_per_point()
+        face_quat = self.rotation_activation(matrix_to_quaternion(orien))
+        return self.rotation_activation(quaternion_multiply(face_quat, self.rotation_activation(self._rotation)))
 
     @property
     def get_xyz(self):
-        return self._xyz
+        from scene.flame_gaussian_model import binding_mode
+        if self.flame_binding is None:
+            return self._xyz
+        if binding_mode() == 'hybrid':
+            return self.get_canonical_xyz
+        return self.get_canonical_xyz
 
     @property
     def get_canonical_xyz(self):
-        return self.flame_binding.get_canonical_points() + self._xyz
+        from scene.flame_gaussian_model import binding_mode
+        if binding_mode() == 'hybrid':
+            return self.flame_binding.get_canonical_points() + self._xyz
+        center, orien, scaling = self._canonical_frame_per_point()
+        rotated = torch.bmm(orien, self._xyz.unsqueeze(-1)).squeeze(-1)
+        return rotated * scaling + center
+
+    def world_to_local_xyz(self, world_xyz, face_idx=None):
+        """Convert world positions into the parent triangles' local coordinates."""
+        center, orien, scaling = self.flame_binding.canonical_face_frames()
+        fi = self.flame_binding.face_indices if face_idx is None else face_idx
+        c, R, k = center[fi], orien[fi], scaling[fi]
+        return torch.bmm(R.transpose(1, 2), ((world_xyz - c) / (k + 1e-12)).unsqueeze(-1)).squeeze(-1)
+
+    def scale_world_to_local_log(self, world_scale, face_idx=None):
+        """Convert world-space scales into local log-scales (_scaling convention)."""
+        _, _, scaling = self.flame_binding.canonical_face_frames()
+        fi = self.flame_binding.face_indices if face_idx is None else face_idx
+        return self.scaling_inverse_activation(world_scale / (scaling[fi] + 1e-12))
 
     @property
     def get_features(self):
@@ -181,9 +273,19 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros(self.get_xyz.shape[0], device='cuda')
+        self.max_radii2D = torch.zeros(self._xyz.shape[0], device='cuda')
         self.neural_renderer = GridRenderer(bound=(torch.tensor(pcd.points).max(0).values - torch.tensor(pcd.points).min(0).values).max() / 2 * 1.2, coord_center=torch.tensor(pcd.points).mean(0)).cuda()
         self._init_flame_binding(face_indices, bary_coords, canonical_vertices)
+        # Local mode: express the sampled surface points and their world-space initial
+        # scales in the triangle-local parameterization (so world accessors reproduce
+        # them). Hybrid mode keeps zero world offsets around the barycentric anchors.
+        from scene.flame_gaussian_model import binding_mode
+        if binding_mode() == 'local':
+            with torch.no_grad():
+                bary_points = self.flame_binding.get_canonical_points()
+                self._xyz.data = self.world_to_local_xyz(bary_points)
+                _, _, k_pt = self._canonical_frame_per_point()
+                self._scaling.data = self._scaling.data - torch.log(k_pt + 1e-12)
 
     def _init_flame_binding(self, face_indices, bary_coords, canonical_vertices):
         """Initializes the FLAME binding system with pre-computed binding info."""
@@ -200,8 +302,8 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
+        self.xyz_gradient_accum = torch.zeros((self._xyz.shape[0], 1), device='cuda')
+        self.denom = torch.zeros((self._xyz.shape[0], 1), device='cuda')
         l = [{'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, 'name': 'xyz'}, {'params': [self._features_dc], 'lr': training_args.feature_lr, 'name': 'f_dc'}, {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, 'name': 'f_rest'}, {'params': [self._opacity], 'lr': training_args.opacity_lr, 'name': 'opacity'}, {'params': [self._scaling], 'lr': training_args.scaling_lr, 'name': 'scaling'}, {'params': [self._rotation], 'lr': training_args.rotation_lr, 'name': 'rotation'}]
         l += self.neural_renderer.get_params(lr=0.005, lr_net=0.0005)
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -391,22 +493,35 @@ class GaussianModel:
         self._opacity = optimizable_tensors['opacity']
         self._scaling = optimizable_tensors['scaling']
         self._rotation = optimizable_tensors['rotation']
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
-        self.max_radii2D = torch.zeros(self.get_xyz.shape[0], device='cuda')
+        self.xyz_gradient_accum = torch.zeros((self._xyz.shape[0], 1), device='cuda')
+        self.denom = torch.zeros((self._xyz.shape[0], 1), device='cuda')
+        self.max_radii2D = torch.zeros(self._xyz.shape[0], device='cuda')
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
-        n_init_points = self.get_xyz.shape[0]
+        n_init_points = self._xyz.shape[0]
         padded_grad = torch.zeros(n_init_points, device='cuda')
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
+        if self._mouth_growth_blocked():
+            selected_pts_mask = torch.logical_and(selected_pts_mask, ~self.mouth_mask)
+        from scene.flame_gaussian_model import binding_mode
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device='cuda')
         samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
+        rots = build_rotation(self.get_rotation[selected_pts_mask]).repeat(N, 1, 1)
+        sampled_world = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        if binding_mode() == 'hybrid':
+            # _xyz is a world offset around the (inherited) barycentric anchor.
+            parent_anchor = self.flame_binding.get_canonical_points()[selected_pts_mask].repeat(N, 1)
+            new_xyz = sampled_world - parent_anchor
+            new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
+        else:
+            # Children inherit the parent's triangle binding: express the sampled world
+            # position / shrunken world scale back in that triangle's local frame.
+            parent_fi = self.flame_binding.face_indices[selected_pts_mask].repeat(N)
+            new_xyz = self.world_to_local_xyz(sampled_world, face_idx=parent_fi)
+            new_scaling = self.scale_world_to_local_log(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N), face_idx=parent_fi)
         new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
@@ -425,6 +540,8 @@ class GaussianModel:
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent)
+        if self._mouth_growth_blocked():
+            selected_pts_mask = torch.logical_and(selected_pts_mask, ~self.mouth_mask)
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -449,6 +566,8 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if self.freeze_mouth_set and self.mouth_mask is not None:
+            prune_mask = torch.logical_and(prune_mask, ~self.mouth_mask)
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 

@@ -44,7 +44,7 @@ class MLP(nn.Module):
 
 class MotionNetwork(nn.Module):
 
-    def __init__(self, audio_dim=256, ind_dim=0, args=None, num_speakers: int=None):
+    def __init__(self, audio_dim=256, ind_dim=32, args=None, num_speakers: int=None):
         super(MotionNetwork, self).__init__()
         if args.audio_extractor != 'wav2vec2':
             raise ValueError('EmoTaG expects --audio_extractor wav2vec2.')
@@ -132,7 +132,10 @@ class MotionNetwork(nn.Module):
         proj = self.pos_encoder(proj)
         encoded_seq = self.audio_transformer(proj)
         audio_tokens = encoded_seq
-        pooled = audio_tokens.mean(dim=1)
+        # Center-token readout instead of mean pooling: the wav2vec sub-tokens span a
+        # short window and averaging them low-passes articulation timing. Self-attention
+        # still mixes the full window into the center token as context.
+        pooled = audio_tokens[:, audio_tokens.shape[1] // 2]
         if return_logits:
             return (pooled, None)
         return pooled
@@ -196,6 +199,9 @@ class MotionNetwork(nn.Module):
             aud_feat = self._adain(aud_feat, identity, self.audio_adain)
         h = aud_feat
         if self.individual_dim > 0 and c is not None:
+            # Broadcast the per-identity code across the audio-window batch.
+            if c.shape[0] != h.shape[0]:
+                c = c.expand(h.shape[0], -1)
             h = torch.cat([h, c], dim=-1)
         shared = self.backbone_net(h)
         au_feat = self.encode_au(au, batch_size=shared.shape[0], device=shared.device, dtype=shared.dtype)
@@ -249,9 +255,12 @@ class MotionNetwork(nn.Module):
             h_in = torch.cat([enc_x, aud_rep], dim=-1)
         h1 = self.mouth_mlp(h_in)
         pred = self.mouth_head(h1)
-        d_mu = pred[..., :3] * 0.01
-        d_rot = pred[..., 3:7]
-        d_scale = pred[..., 7:10] * 0.001
+        # Bound the intra-oral corrections with tanh: there is no direct supervision on
+        # these fine deltas, so an unconstrained head can diverge. The caps leave ample
+        # room for real lip motion (FLAME jaw already handles the gross opening).
+        d_mu = torch.tanh(pred[..., :3]) * 0.02
+        d_rot = torch.tanh(pred[..., 3:7]) * 0.1
+        d_scale = torch.tanh(pred[..., 7:10]) * 0.005
         return {'d_mu': d_mu, 'd_rot': d_rot, 'd_scale': d_scale}
 
     def forward(self, a, c=None, au=None, identity=None):
@@ -282,11 +291,21 @@ class MotionNetwork(nn.Module):
             params.extend([{'params': self.individual_codes, 'name': 'neural_individual_codes', 'lr': lr, 'weight_decay': wd}])
         return params
 
-    def freeze_for_adaptation(self):
-        """Freeze the motion prior and tune only the AdaIN modulation parameters."""
-        adain_modules = (self.audio_adain, self.au_adain)
+    def freeze_for_adaptation(self, unfreeze_heads=False):
+        """Freeze the motion prior and tune only the AdaIN modulation parameters.
+
+        unfreeze_heads additionally lets the small prediction heads (FLAME exp/jaw
+        and the intra-oral triplane decoder) fine-tune: articulation style is
+        identity-specific and the frozen heads otherwise carry the pretrain corpus'
+        average articulation into the new identity."""
+        adain_modules = [self.audio_adain, self.au_adain]
         for param in self.parameters():
             param.requires_grad_(False)
+        if unfreeze_heads:
+            for name in ('flame_exp_head', 'flame_jaw_head', 'exp_head', 'jaw_head', 'mouth_head', 'mouth_mlp'):
+                m = getattr(self, name, None)
+                if m is not None:
+                    adain_modules.append(m)
         for module in adain_modules:
             for param in module.parameters():
                 param.requires_grad_(True)

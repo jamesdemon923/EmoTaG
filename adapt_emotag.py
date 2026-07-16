@@ -8,6 +8,7 @@ from gaussian_renderer import render, render_motion
 import sys
 from scene import Scene, GaussianModel, MotionNetwork
 from utils.general_utils import safe_state
+from utils.mask_utils import unpack_bool_mask
 import lpips
 import uuid
 from tqdm import tqdm
@@ -26,7 +27,7 @@ import matplotlib.pyplot as plt
 from torchvision.utils import save_image
 import numpy as np
 from PIL import Image
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, mode_long, pretrain_ckpt_path, warm_up_iter, adapt_adain_only=False):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, mode_long, pretrain_ckpt_path, warm_up_iter, adapt_adain_only=False, adapt_unfreeze_heads=False):
     scene_name = os.path.basename(dataset.model_path)
     loss_history = {scene_name: []}
     testing_iterations = [1] + [i for i in range(0, opt.iterations + 1, 10000)]
@@ -38,18 +39,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         new_opacity_reset_interval = warm_up_iter
         opt.opacity_reset_interval = new_opacity_reset_interval
     opt.densify_until_iter = opt.iterations - 1000
+    # Ease the motion deformation in gradually after warm-up (curriculum_weight 0 -> 1)
+    # so the full deformation is not applied abruptly to the statically warmed-up
+    # Gaussians. Mirrors the pre-training schedule.
+    curriculum_transition_iters = max(1, int((opt.iterations - warm_up_iter) * 0.1))
+    curriculum_start_iter = warm_up_iter + 1
+    curriculum_end_iter = curriculum_start_iter + curriculum_transition_iters
     first_iter = 0
     motion_net = MotionNetwork(args=dataset).cuda()
     motion_optimizer = torch.optim.AdamW(motion_net.get_params(0.005, 0.0005), betas=(0.9, 0.99), eps=1e-08, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.LambdaLR(motion_optimizer, lambda iter: 0.1 ** (iter / opt.iterations))
     os.makedirs(dataset.model_path, exist_ok=True)
+    with open(os.path.join(dataset.model_path, 'cfg_args'), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(dataset))))
     flame_params_file = os.path.join(dataset.source_path, 'flame_params.npz')
     if not os.path.exists(flame_params_file):
-        sys.exit(1)
+        sys.exit(f'[adapt] Missing {flame_params_file}. Run the data-preparation pipeline for this scene first.')
     model_center_path = os.path.join(dataset.source_path, 'model_center.npy')
     if not os.path.exists(model_center_path):
-        sys.exit(1)
+        sys.exit(f'[adapt] Missing {model_center_path}. Run the data-preparation pipeline for this scene first.')
     model_center = np.load(model_center_path)
+    dataset.model_center = model_center
     flame_wrapper = SimpleFlameWrapper(flame_params_file=flame_params_file).cuda()
     gaussians = GaussianModel(dataset)
     gaussians.flame_wrapper = flame_wrapper
@@ -59,10 +69,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.identity_feature = torch.from_numpy(np.load(identity_path).reshape(-1)).float().cuda()
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
-    motion_params, _, _ = torch.load(pretrain_ckpt_path)
+    if pretrain_ckpt_path is None or not os.path.exists(pretrain_ckpt_path):
+        sys.exit(
+            f'[adapt] --pretrain_path is required and must point to an existing multi-identity '
+            f'EMA checkpoint (e.g. output/pretrain/chkpnt_ema_face_latest.pth). Got: {pretrain_ckpt_path}'
+        )
+    pretrain_ckpt = torch.load(pretrain_ckpt_path, map_location='cpu')
+    if isinstance(pretrain_ckpt, (list, tuple)) and len(pretrain_ckpt) == 3:
+        # Multi-identity EMA / motion-only checkpoint: (motion_state, optimizer_state, iter).
+        motion_params = pretrain_ckpt[0]
+    elif isinstance(pretrain_ckpt, (list, tuple)) and len(pretrain_ckpt) == 4:
+        # Per-scene checkpoint: (gaussians, motion_state, optimizer_state, iter).
+        motion_params = pretrain_ckpt[1]
+    elif isinstance(pretrain_ckpt, dict):
+        motion_params = pretrain_ckpt
+    else:
+        sys.exit(
+            f'[adapt] Unrecognized pretrain checkpoint structure at {pretrain_ckpt_path}. '
+            f'Expected a 3-tuple EMA checkpoint, a 4-tuple per-scene checkpoint, or a raw state_dict.'
+        )
     motion_net.load_state_dict(motion_params)
     if adapt_adain_only:
-        motion_net.freeze_for_adaptation()
+        motion_net.freeze_for_adaptation(unfreeze_heads=adapt_unfreeze_heads)
     try:
         mouth_idx_path = os.path.join(dataset.source_path, 'mouth_point_indices.npy')
         mouth_indices_np = np.load(mouth_idx_path)
@@ -75,8 +103,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mouth_mask[mouth_indices.to(mouth_mask.device)] = True
         gaussians.mouth_indices = mouth_indices.to('cuda')
         gaussians.mouth_mask = mouth_mask
+        # Few-shot adaptation: cap the intra-oral subset at a small multiple of its
+        # anatomical initialization (see GaussianModel.freeze_mouth_set for the
+        # unbounded-growth failure mode; ~1k gaussians are too few for teeth detail).
+        gaussians.freeze_mouth_set = True
+        gaussians.mouth_budget = int(opt.mouth_budget_factor * max(1, int(mouth_mask.sum().item())))
     except Exception as e:
-        sys.exit(1)
+        sys.exit(f'[adapt] Failed to load mouth_point_indices.npy for this scene: {e}')
     if checkpoint:
         model_params, motion_params, motion_optimizer_params, first_iter = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -111,8 +144,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         stats_tracker.record_training(scene_name, current_frame_id)
         if iteration - 1 == debug_from:
             pipe.debug = True
-        face_mask = torch.as_tensor(viewpoint_cam.talking_dict['face_mask']).cuda()
-        hair_mask = torch.as_tensor(viewpoint_cam.talking_dict['hair_mask']).cuda()
+        face_mask = torch.as_tensor(unpack_bool_mask(viewpoint_cam.talking_dict['face_mask'])).cuda()
+        hair_mask = torch.as_tensor(unpack_bool_mask(viewpoint_cam.talking_dict['hair_mask'])).cuda()
         head_mask = face_mask
         if iteration <= warm_up_iter:
             # First stabilize the identity-specific Gaussian appearance.
@@ -126,7 +159,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             radii = render_pkg['radii']
             gt_image_original = viewpoint_cam.original_image.cuda() / 255.0
             gt_image = gt_image_original * head_mask + background[:, None, None] * ~head_mask
-            lambda_ssim = 0.2
+            lambda_ssim = opt.lambda_dssim
             photo_l1_loss = l1_loss(rendered_image, gt_image)
             photo_ssim_loss = 1.0 - ssim(rendered_image, gt_image)
             loss = (1.0 - lambda_ssim) * photo_l1_loss + lambda_ssim * photo_ssim_loss
@@ -134,7 +167,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Then optimize the personalized motion response with FLAME supervision.
             if iteration == warm_up_iter + 1:
                 print('Starting dynamic motion stage.')
-            render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background, debug_viz=iteration == 1)
+            if iteration < curriculum_start_iter:
+                curriculum_weight = 0.0
+            elif iteration >= curriculum_end_iter:
+                curriculum_weight = 1.0
+            else:
+                curriculum_weight = min(1.0, max(0.0, (iteration - curriculum_start_iter) / curriculum_transition_iters))
+            render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background, debug_viz=iteration == 1, curriculum_weight=curriculum_weight, drive_with_gt=True)
             rendered_image = render_pkg['render']
             alpha = render_pkg['alpha']
             viewspace_point_tensor = render_pkg['viewspace_points']
@@ -151,13 +190,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_jaw_flat = gt_jaw.squeeze()
             gt_image_original = viewpoint_cam.original_image.cuda() / 255.0
             gt_image = gt_image_original * head_mask + background[:, None, None] * ~head_mask
-            lambda_ssim = 0.2
+            lambda_ssim = opt.lambda_dssim
             photo_l1_loss = l1_loss(rendered_image, gt_image)
             photo_ssim_loss = 1.0 - ssim(rendered_image, gt_image)
             rendering_loss = (1.0 - lambda_ssim) * photo_l1_loss + lambda_ssim * photo_ssim_loss
+            # Perceptual term: keeps high-frequency facial detail that the L1/SSIM
+            # optimum blurs away under residual geometric misalignment.
+            if opt.w_lpips > 0:
+                if not hasattr(training, '_lpips_fn'):
+                    training._lpips_fn = lpips.LPIPS(net='alex').eval().cuda()
+                    for p in training._lpips_fn.parameters():
+                        p.requires_grad_(False)
+                lpips_loss = training._lpips_fn(rendered_image.unsqueeze(0), gt_image.unsqueeze(0), normalize=True).squeeze()
+                rendering_loss = rendering_loss + opt.w_lpips * lpips_loss
+            # Mouth-crop loss: the intra-oral region is visible in only a handful of
+            # the adaptation frames and receives almost no gradient share from the
+            # full-frame terms; weight the lips_rect crop explicitly (the original
+            # pipeline used a dedicated mouth training stage for the same reason).
+            if opt.w_mouth_crop > 0:
+                mx0, mx1, my0, my1 = viewpoint_cam.talking_dict['lips_rect']
+                mx0, mx1 = max(0, int(mx0)), min(rendered_image.shape[1], int(mx1))
+                my0, my1 = max(0, int(my0)), min(rendered_image.shape[2], int(my1))
+                if mx1 - mx0 > 8 and my1 - my0 > 8:
+                    rc = rendered_image[:, mx0:mx1, my0:my1]
+                    gc = gt_image[:, mx0:mx1, my0:my1]
+                    mouth_loss = l1_loss(rc, gc)
+                    if opt.w_lpips > 0:
+                        rcu = F.interpolate(rc.unsqueeze(0), size=(128, 128), mode='bilinear', align_corners=False)
+                        gcu = F.interpolate(gc.unsqueeze(0), size=(128, 128), mode='bilinear', align_corners=False)
+                        mouth_loss = mouth_loss + 0.2 * training._lpips_fn(rcu, gcu, normalize=True).squeeze()
+                    rendering_loss = rendering_loss + opt.w_mouth_crop * mouth_loss
             flame_exp_loss = F.mse_loss(pred_exp_flat, gt_exp_flat)
             flame_jaw_loss = F.mse_loss(pred_jaw_flat, gt_jaw_flat)
-            flame_reg_loss = flame_exp_loss + flame_jaw_loss
+            # Jaw is THE lip-sync driver but its MSE (radians, ~1e-3) is drowned by the
+            # 50-dim expression MSE (~0.2-0.8); unweighted, the jaw regression tends to
+            # collapse toward the mean. Reweight so the jaw term matches the
+            # rendering-loss scale.
+            flame_reg_loss = flame_exp_loss + opt.w_jaw_reg * flame_jaw_loss
             w_rendering = 1.0
             w_flame_reg = 0.1
             loss = w_rendering * rendering_loss + w_flame_reg * flame_reg_loss
@@ -187,6 +256,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         print(f'[warn] Skipping geometric loss (shape mismatch?): {geo_exc}')
                         training._geo_warned = True
             flame_debugger.record_flame_params(iteration, scene_name, current_frame_id, pred_exp, pred_jaw, gt_exp, gt_jaw, rendering_loss, flame_reg_loss)
+        # GaussianAvatars anti-drift regularizers, in triangle-local units: keep
+        # gaussians within ~1 triangle of their parent and no larger than ~0.6
+        # triangle sizes. Without these, offsets grow until the avatar only
+        # renders correctly on the adaptation frames. In 'local' binding mode the
+        # raw parameters are already local; in 'hybrid' mode _xyz is a world
+        # offset, so normalize by the parent triangle size first.
+        if (opt.lambda_xyz > 0 or opt.lambda_scale > 0) and gaussians.flame_binding is not None:
+            from scene.flame_gaussian_model import binding_mode
+            vis = visibility_filter
+            if binding_mode() == 'hybrid':
+                k_pt = gaussians.flame_binding.canonical_face_frames()[2][:, 0][gaussians.flame_binding.face_indices] + 1e-8
+                local_off = gaussians._xyz.norm(dim=1) / k_pt
+                local_scale = gaussians.scaling_activation(gaussians._scaling) / k_pt.unsqueeze(1)
+            else:
+                local_off = gaussians._xyz.norm(dim=1)
+                local_scale = gaussians.scaling_activation(gaussians._scaling)
+            if opt.lambda_xyz > 0:
+                loss = loss + opt.lambda_xyz * F.relu(local_off[vis] - opt.threshold_xyz).mean()
+            if opt.lambda_scale > 0:
+                loss = loss + opt.lambda_scale * F.relu(local_scale[vis] - opt.threshold_scale).norm(dim=1).mean()
         loss.backward()
         iter_end.record()
         with torch.no_grad():
@@ -225,10 +314,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.reset_opacity()
             if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 from utils.sh_utils import eval_sh
-                shs_view = gaussians.get_features.transpose(1, 2).view(-1, 3, (gaussians.max_sh_degree + 1) ** 2)
+                # Reshape by the ACTUAL SH coeff count (get_features dim 1) rather than
+                # (max_sh_degree+1)**2: in adaptation those can disagree (features were
+                # allocated at a higher degree than the max_sh_degree attribute reports),
+                # which otherwise makes this view() raise a shape error.
+                _n_sh = gaussians.get_features.shape[1]
+                shs_view = gaussians.get_features.transpose(1, 2).view(-1, 3, _n_sh)
                 dir_pp = gaussians.get_xyz - viewpoint_cam.camera_center.repeat(gaussians.get_features.shape[0], 1)
                 dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-                sh2rgb = eval_sh(gaussians.active_sh_degree, shs_view, dir_pp_normalized)
+                _eval_deg = min(gaussians.active_sh_degree, int(round(_n_sh ** 0.5)) - 1)
+                sh2rgb = eval_sh(_eval_deg, shs_view, dir_pp_normalized)
                 colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
                 bg_color_mask = (colors_precomp[..., 0] < 30 / 255) * (colors_precomp[..., 1] > 225 / 255) * (colors_precomp[..., 2] < 30 / 255)
                 gaussians.prune_points(bg_color_mask.squeeze())
@@ -269,7 +364,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print('\nOK Finished saving deformed Gaussians.')
     image_debugger.save_final_images()
     stats_tracker.save_final_report(iteration)
-    flame_debugger.generate_final_summary()
+    flame_debugger.generate_final_report()
 if __name__ == '__main__':
     parser = ArgumentParser(description='Training script parameters')
     lp = ModelParams(parser)
@@ -288,10 +383,11 @@ if __name__ == '__main__':
     parser.add_argument('--pretrain_path', type=str, default=None)
     parser.add_argument('--warm_up_iter', type=int, default=500, help='Number of warm-up iterations with static rendering only')
     parser.add_argument('--adapt_adain_only', action='store_true', default=False, help='Freeze the pretrained GRMN and tune only the AdaIN modulation parameters')
+    parser.add_argument('--adapt_unfreeze_heads', action='store_true', default=False, help='With --adapt_adain_only, also fine-tune the small FLAME/mouth prediction heads (identity-specific articulation)')
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     print('Optimizing ' + args.model_path)
     safe_state(args.quiet)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.long, args.pretrain_path, args.warm_up_iter, args.adapt_adain_only)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.long, args.pretrain_path, args.warm_up_iter, args.adapt_adain_only, args.adapt_unfreeze_heads)
     print('\nTraining complete.')

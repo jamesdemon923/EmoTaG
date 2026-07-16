@@ -202,8 +202,12 @@ def main():
         raise ValueError("invalid input shape")
 
     mp.log_to_stderr()
-    torch._inductor.config.force_fuse_int_mm_with_mul = True
-    torch._inductor.config.use_mixed_mm = True
+    try:
+        import torch._inductor.config as _ind_cfg
+        _ind_cfg.force_fuse_int_mm_with_mul = True
+        _ind_cfg.use_mixed_mm = True
+    except Exception:
+        pass  # optional inductor fusion hints; not available on all torch versions
 
     start = time.time()
 
