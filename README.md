@@ -79,8 +79,15 @@ EmoTaG is trained and evaluated on two public talking-head corpora:
 | [MEAD](https://wywu.github.io/projects/MEAD/MEAD.html) | Emotional evaluation | A subset of 5 emotions × 3 intensity levels (2 identities per emotion) from MEAD, for the emotional / emotion-intensity tests. |
 
 Please obtain both datasets from their official sources and follow their
-respective licenses. All clips are face-centered cropped and resized to
-**512 × 512 at 25 FPS** before processing.
+respective licenses. All clips must be face-centered cropped and resized to
+**512 × 512 at 25 FPS** before processing. HDTF ships official crop metadata;
+for MEAD / custom videos use the bundled cropper (a square, uniformly scaled
+crop — no aspect distortion):
+
+```bash
+python tools/crop_video.py --input raw.mp4 --output data/<ID>/<ID>.mp4
+# preview the detected crop first with --dry_run
+```
 
 ---
 
