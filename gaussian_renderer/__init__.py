@@ -127,6 +127,24 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     deformed_rotations = deformed_gaussians['rotation']
     w = curriculum_weight
     means3D = (1.0 - w) * canonical_xyz + w * deformed_xyz
+    # Expression-conditioned deformation prior: a shared decoder (pretrained across
+    # identities) predicts a small per-gaussian position correction for the FLAME
+    # per-frame registration residual that static offsets cannot capture on unseen
+    # expressions. Gated by the curriculum weight (only corrects the deformed state)
+    # and zero-init at pretrain start, so absent/untrained it is an exact no-op.
+    deform_decoder = getattr(pc, 'deform_decoder', None)
+    _delta_color = None
+    if deform_decoder is not None and w > 0:
+        _didx = int(getattr(pc, 'identity_index', 0))
+        _dcode = getattr(pc, 'deform_code', None)  # novel identity (adaptation) overrides the table
+        # Condition on the GRMN motion feature (from audio+AU): identical at train and
+        # inference (never the teacher-forced GT expression), so the correction transfers.
+        _mfeat = preds.get('encoded_motion', None)
+        if _mfeat is None:
+            _mfeat = preds.get('encoded_audio', None)
+        if _mfeat is not None:
+            _delta, _delta_color = deform_decoder(canonical_xyz, _mfeat, idx=_didx, code=_dcode)
+            means3D = means3D + w * _delta
     scales = (1.0 - w) * canonical_scales + w * deformed_scales
     rotations = (1.0 - w) * canonical_rotations + w * deformed_rotations
     rotations = F.normalize(rotations, p=2, dim=1)
@@ -134,6 +152,12 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     cov3D_precomp = None
     colors_precomp = None
     shs = pc.get_features
+    # Expression-conditioned appearance correction: the decoder's colour head offsets
+    # the DC-SH term so expression/pose-dependent shading (wrinkles, self-shadow) that
+    # the static per-gaussian colour cannot represent is added back per frame.
+    if _delta_color is not None:
+        shs = shs.clone()
+        shs[:, 0, :] = shs[:, 0, :] + w * _delta_color
     mouth_pred = None
     mouth_mask = getattr(pc, 'mouth_mask', None)
     if mouth_mask is not None and mouth_mask.numel() == means3D.shape[0] and mouth_mask.any():

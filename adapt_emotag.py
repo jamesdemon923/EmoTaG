@@ -38,6 +38,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if warm_up_iter > 0:
         new_opacity_reset_interval = warm_up_iter
         opt.opacity_reset_interval = new_opacity_reset_interval
+    # Optional override: frequent opacity resets (every warm_up_iter) can suppress
+    # fine sharp detail late in adaptation. EMOTAG_OPACITY_RESET sets the interval.
+    _opr = os.environ.get('EMOTAG_OPACITY_RESET')
+    if _opr:
+        opt.opacity_reset_interval = int(_opr)
     opt.densify_until_iter = opt.iterations - 1000
     # Ease the motion deformation in gradually after warm-up (curriculum_weight 0 -> 1)
     # so the full deformation is not applied abruptly to the statically warmed-up
@@ -115,8 +120,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.restore(model_params, opt)
         motion_net.load_state_dict(motion_params)
         motion_optimizer.load_state_dict(motion_optimizer_params)
-    if not mode_long:
+    # Adaptation caps the SH degree at 1 by default; EMOTAG_ADAPT_SH2=1 keeps the
+    # full degree (args.sh_degree) for more view-dependent colour capacity.
+    if not mode_long and os.environ.get('EMOTAG_ADAPT_SH2') != '1':
         gaussians.max_sh_degree = 1
+    # Expression-conditioned deformation prior (EMOTAG_DEFORM=1): load the shared
+    # decoder pretrained across identities (frozen) and fit only a low-dim identity
+    # code for this novel subject on the 5s clip. The shared decoder supplies the
+    # cross-identity generalization the few-shot data cannot; the tiny code keeps the
+    # fit from overfitting the adaptation frames.
+    deform_optimizer = None
+    if os.environ.get('EMOTAG_DEFORM') == '1':
+        from scene.deform_decoder import ExprDeformDecoder
+        # EMOTAG_DEFORM_CKPT lets a sweep point at a specific decoder snapshot.
+        deform_ckpt = os.environ.get('EMOTAG_DEFORM_CKPT') or \
+            os.path.join(os.path.dirname(pretrain_ckpt_path), 'chkpnt_deform_ema_latest.pth')
+        if not os.path.exists(deform_ckpt):
+            sys.exit(f'[adapt] EMOTAG_DEFORM=1 but no deformation prior at {deform_ckpt}')
+        dd = ExprDeformDecoder().cuda()
+        dd.load_state_dict(torch.load(deform_ckpt, map_location='cuda:0')[0])
+        for p in dd.parameters():
+            p.requires_grad_(False)
+        dd.eval()
+        gaussians.deform_decoder = dd
+        # Novel identity: init the code at the pretrained mean and optimize just it.
+        init_code = dd.id_codes.detach().mean(dim=0, keepdim=True).clone()
+        gaussians.deform_code = torch.nn.Parameter(init_code.cuda())
+        deform_optimizer = torch.optim.AdamW([gaussians.deform_code], lr=5e-3, betas=(0.9, 0.99))
+        print('loaded expression deformation prior; fitting identity code')
     bg_color = [0, 1, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
     iter_start = torch.cuda.Event(enable_timing=True)
@@ -303,6 +334,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ckpt = (gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
                 torch.save(ckpt, scene.model_path + '/chkpnt_face_' + str(iteration) + '.pth')
                 torch.save(ckpt, scene.model_path + '/chkpnt_face_latest' + '.pth')
+                if deform_optimizer is not None:
+                    torch.save(gaussians.deform_code.detach().cpu(), scene.model_path + '/deform_code.pth')
+                    # Self-contained: stash the frozen shared decoder next to the code so
+                    # evaluation needs only the model dir.
+                    torch.save(gaussians.deform_decoder.state_dict(), scene.model_path + '/deform_decoder.pth')
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -336,6 +372,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     motion_optimizer.step()
                     motion_optimizer.zero_grad(set_to_none=True)
                     scheduler.step()
+                    if deform_optimizer is not None:
+                        deform_optimizer.step()
+                        deform_optimizer.zero_grad(set_to_none=True)
     print('\n[FINAL] Saving final deformed Gaussians for the first 10 frames of each scene...')
     with torch.no_grad():
         # Save compact geometry snapshots for quick inspection.

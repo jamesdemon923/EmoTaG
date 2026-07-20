@@ -234,7 +234,7 @@ The checker reports whether each required scene file is present and valid.
 
 ```bash
 python pretrain_emotag.py \
-  -s data/pretrain \
+  -s data \
   -m output/pretrain \
   --scene_names_file data/hdtf_pretrain_ids.txt \
   --audio_extractor wav2vec2 \
@@ -260,12 +260,14 @@ python adapt_emotag.py \
   --audio_extractor wav2vec2 \
   --pretrain_path output/pretrain/chkpnt_ema_face_latest.pth \
   --iterations 20000 \
+  --warm_up_iter 1000 \
   --N_views 125 \
-  --adapt_adain_only          
+  --adapt_adain_only \
+  --adapt_unfreeze_heads
 ```
 
 > `--adapt_adain_only` freezes the pretrained GRMN and tunes only the AdaIN
-> modulation; optionally add `--adapt_unfreeze_heads` to also fine-tune the small
+> modulation; `--adapt_unfreeze_heads` additionally fine-tunes the small
 > FLAME/mouth prediction heads. Full hyper-parameters are in
 > [`configs/adapt_5s.yaml`](configs/adapt_5s.yaml). `--pretrain_path` takes the
 > multi-identity EMA checkpoint from the pre-training root.
@@ -280,49 +282,60 @@ To skip pre-training, download the multi-identity motion prior and adapt directl
 python adapt_emotag.py -s data/<ID> -m output/<ID> \
   --audio_extractor wav2vec2 \
   --pretrain_path /path/to/chkpnt_ema_face_latest.pth \
-  --iterations 20000 --N_views 125 --adapt_adain_only
+  --iterations 20000 --warm_up_iter 1000 --N_views 125 \
+  --adapt_adain_only --adapt_unfreeze_heads
 ```
 
-Trained on HDTF identities ([`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt))
-with the recipe in [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
+Pre-trained on quality-filtered HDTF identities
+(from [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt)) with the recipe
+in [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
 
 ---
 
 ## Inference
 
-Render a trained scene:
+Render the composited video (the synthesized head over the per-frame
+torso+background, the standard talking-head protocol):
 
 ```bash
-python synthesize.py \
+python tools/render_composited.py \
   -s data/<ID> \
   -m output/<ID> \
-  --use_train
+  --audio_extractor wav2vec2
 ```
+
+This writes `output/<ID>/test/rendered_comp.mp4` and the matching
+`gt_comp.mp4`. For a head-only green-screen preview use `synthesize.py`.
 
 ---
 
 ## Evaluation
 
-### Video-level metrics
+Render the held-out segment (frames after the 5s/125-frame adaptation clip)
+and compute the video metrics on it:
 
 ```bash
+python tools/render_composited.py \
+  -s data/<ID> -m output/<ID> \
+  --audio_extractor wav2vec2 --eval_from 125
+
 python evaluate_metrics.py video \
-  output/<ID>/train/rendered_video.mp4 \
-  output/<ID>/train/gt_video.mp4 \
-  output/<ID>/train
+  output/<ID>/test/rendered_comp.mp4 \
+  output/<ID>/test/gt_comp.mp4 \
+  output/<ID>/test
 ```
 
 ### Action-Unit metrics (optional)
 
 The AU error (AUE) compares AU intensities between the rendered and the
-ground-truth videos. First run an AU extractor (see Step 3) on the **frames of
+ground-truth videos. First run an AU extractor (see Step 4) on the **frames of
 each video** to produce two CSVs, then:
 
 ```bash
 python evaluate_metrics.py au \
-  output/<ID>/train/rendered_au.csv \
-  output/<ID>/train/gt_au.csv \
-  --output_dir output/<ID>/train
+  output/<ID>/test/rendered_au.csv \
+  output/<ID>/test/gt_au.csv \
+  --output_dir output/<ID>/test
 ```
 
 ## Acknowledgements

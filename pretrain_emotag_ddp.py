@@ -61,12 +61,14 @@ def _ddp_average_grads(module, world_size):
     # The per-identity code table is sharded by identity: each row is touched by at
     # most one rank per step, so the all_reduce SUM already yields that row's full
     # gradient and must NOT be divided by world_size.
-    ind_codes = getattr(module, 'individual_codes', None)
+    # Identity-sharded tables (motion individual_codes, deform id_codes): each row is
+    # touched by at most one rank per step, so SUM already gives the full gradient.
+    sharded = {getattr(module, 'individual_codes', None), getattr(module, 'id_codes', None)}
     for p in module.parameters():
         if p.grad is None:
             p.grad = torch.zeros_like(p.data)
         dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
-        if p is not ind_codes:
+        if p not in sharded:
             p.grad.data /= world_size
 
 def _split_scene_names(raw_scene_names):
@@ -149,6 +151,21 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     is_dist = world_size > 1
     is_main = (rank == 0)
     full_data_list = resolve_pretrain_scene_names(dataset)
+    # Optional load balancing (EMOTAG_BALANCE=1): scenes vary widely in frame count, and
+    # round-robin-by-name sharding leaves fast ranks idle at each all_reduce barrier
+    # waiting on the rank that drew the big scenes. Sorting by frame count before the
+    # round-robin split spreads the heavy scenes evenly across ranks. The order change
+    # only re-labels identity_index (a consistent bijection), which does not affect the
+    # shared motion/deform weights that get delivered.
+    if os.environ.get('EMOTAG_BALANCE') == '1':
+        import json as _json
+        def _nframes(name):
+            try:
+                p = os.path.join(dataset.source_path, name, 'transforms.json')
+                return len(_json.load(open(p)).get('frames', []))
+            except Exception:
+                return 0
+        full_data_list = sorted(full_data_list, key=_nframes, reverse=True)
     if is_dist:
         data_list = full_data_list[rank::world_size]
         print(f'[rank {rank}/{world_size}] handling {len(data_list)} scenes: {data_list}', flush=True)
@@ -177,6 +194,19 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     motion_optimizer = torch.optim.AdamW(motion_net.get_params(0.005, 5e-05), betas=(0.9, 0.99), eps=1e-08)
     scheduler = torch.optim.lr_scheduler.LambdaLR(motion_optimizer, lambda iter: 0.1 ** (iter / opt.iterations))
     ema_motion_net = ExponentialMovingAverage(motion_net.parameters(), decay=0.995)
+    # Expression-conditioned deformation prior (shared across identities). Gated on
+    # EMOTAG_DEFORM so the default pretrain is byte-for-byte unchanged when disabled.
+    deform_decoder = None
+    deform_optimizer = None
+    ema_deform = None
+    if os.environ.get('EMOTAG_DEFORM', '0') == '1':
+        from scene.deform_decoder import ExprDeformDecoder
+        deform_decoder = ExprDeformDecoder(n_id=max(10000, len(full_data_list))).cuda()
+        if is_dist:
+            _ddp_broadcast_module(deform_decoder, src=0)
+        deform_optimizer = torch.optim.AdamW(
+            deform_decoder.get_params(lr_net=5e-4, lr_code=5e-3), betas=(0.9, 0.99), eps=1e-08)
+        ema_deform = ExponentialMovingAverage(deform_decoder.parameters(), decay=0.995)
     scene_list = []
     scene_paths = {}
     for data_name in data_list:
@@ -197,6 +227,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         flame_wrapper = SimpleFlameWrapper(flame_params_file=flame_params_file).cuda()
         gaussians = GaussianModel(dataset)
         gaussians.flame_wrapper = flame_wrapper
+        gaussians.deform_decoder = deform_decoder  # shared instance (None when disabled)
         # AdaFace identity descriptor.
         identity_path = os.path.join(_dataset.source_path, 'identity_feature.npy')
         if os.path.exists(identity_path):
@@ -244,6 +275,17 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
             _ema_net.load_state_dict(ema_ck[0])
             ema_motion_net.shadow_params = [p.detach().clone() for p in _ema_net.parameters()]
             del _ema_net
+        deform_ck_path = os.path.join(checkpoint, 'chkpnt_deform_latest.pth')
+        if deform_decoder is not None and os.path.exists(deform_ck_path):
+            deform_ck = torch.load(deform_ck_path, map_location='cpu')
+            deform_decoder.load_state_dict(deform_ck[0])
+            deform_optimizer.load_state_dict(deform_ck[1])
+            ema_dpath = os.path.join(checkpoint, 'chkpnt_deform_ema_latest.pth')
+            if os.path.exists(ema_dpath):
+                _ema_d = copy.deepcopy(deform_decoder)
+                _ema_d.load_state_dict(torch.load(ema_dpath, map_location='cpu')[0])
+                ema_deform.shadow_params = [p.detach().clone() for p in _ema_d.parameters()]
+                del _ema_d
         for _scene, _name in zip(scene_list, data_list):
             scene_ck_path = os.path.join(checkpoint, _name, 'chkpnt_face_latest.pth')
             scene_ck = torch.load(scene_ck_path, map_location='cuda')
@@ -424,6 +466,12 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                     motion_optimizer.zero_grad(set_to_none=True)
                     scheduler.step()
                     ema_motion_net.update()
+                    if deform_optimizer is not None:
+                        if is_dist:
+                            _ddp_average_grads(deform_decoder, world_size)
+                        deform_optimizer.step()
+                        deform_optimizer.zero_grad(set_to_none=True)
+                        ema_deform.update()
             if iteration in checkpoint_iterations:
                 if is_main:
                     print('\n[ITER {}] Saving Checkpoint'.format(iteration))
@@ -432,6 +480,13 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                     with ema_motion_net.average_parameters():
                         ckpt_ema = (copy.deepcopy(motion_net.state_dict()), motion_optimizer.state_dict(), iteration)
                         torch.save(ckpt_ema, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
+                    if deform_decoder is not None:
+                        # Raw (for exact resume) + EMA (released/adaptation prior).
+                        torch.save((deform_decoder.state_dict(), deform_optimizer.state_dict(), iteration),
+                                   dataset.model_path + '/chkpnt_deform_latest.pth')
+                        with ema_deform.average_parameters():
+                            torch.save((copy.deepcopy(deform_decoder.state_dict()), iteration),
+                                       dataset.model_path + '/chkpnt_deform_ema_latest.pth')
                 for _scene in scene_list:
                     _gaussians = _scene.gaussians
                     ckpt = (_gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)

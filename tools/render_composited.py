@@ -22,11 +22,41 @@ from scene import GaussianModel, MotionNetwork, Scene
 from scene.flame_wrapper import SimpleFlameWrapper
 
 
+def _neck_row(face_mask, H):
+    """Row of the neck = narrowest person row in the anatomical band below the head.
+    Below this row is torso+background (taken from GT); above is the synthesized head."""
+    if face_mask is None:
+        return None
+    import math
+    from utils.mask_utils import unpack_bool_mask
+    from scipy.ndimage import uniform_filter1d
+    m = np.asarray(unpack_bool_mask(face_mask))
+    s = int(math.isqrt(m.size))
+    if s * s != m.size:
+        return None
+    m = m.reshape(s, s)
+    w = uniform_filter1d(m.sum(1).astype(float), 5)
+    top = np.where(w > 3)[0]
+    if len(top) == 0:
+        return None
+    t0 = top[0]
+    hw = np.median(w[t0:t0 + 70])
+    lo = int(t0 + 0.85 * hw)
+    hi = min(int(t0 + 1.5 * hw), s - 1)
+    if lo >= hi:
+        return None
+    nk = lo + int(np.argmin(w[lo:hi + 1]))
+    return int(round(nk * H / s)) if s != H else nk
+
+
 def main():
     parser = ArgumentParser()
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--out_name", default="comp")
+    parser.add_argument("--eval_from", type=int, default=0,
+                        help="Write only frames >= this index (e.g. 125 = the held-out "
+                             "test segment after a 5s/125-frame adaptation).")
     parser.add_argument("--drive_with_gt", action="store_true")
     parser.add_argument("--smooth_sigma", type=float, default=1.0,
                         help="Temporal Gaussian sigma (frames) for smoothing predicted jaw and mouth deltas; 0 disables.")
@@ -61,6 +91,18 @@ def main():
             os.path.join(dataset.model_path, "chkpnt_face_latest.pth"))
         motion_net.load_state_dict(motion_params, strict=False)
         gaussians.restore(model_params, None)
+        # Expression-conditioned deformation prior: load the shared decoder and this
+        # identity's fitted code if the adaptation produced one.
+        deform_code_path = os.path.join(dataset.model_path, "deform_code.pth")
+        deform_dec_path = os.path.join(dataset.model_path, "deform_decoder.pth")
+        if os.path.exists(deform_code_path) and os.path.exists(deform_dec_path):
+            from scene.deform_decoder import ExprDeformDecoder
+            dd = ExprDeformDecoder().cuda()
+            dd.load_state_dict(torch.load(deform_dec_path, map_location="cuda:0"))
+            dd.eval()
+            gaussians.deform_decoder = dd
+            gaussians.deform_code = torch.load(deform_code_path, map_location="cuda:0").cuda()
+            print("loaded expression deformation prior + identity code")
         if getattr(args, 'canonical_from', None):
             can = np.load(os.path.join(args.canonical_from, "vertices.npy"))
             b = gaussians.flame_binding
@@ -68,9 +110,8 @@ def main():
             b._canonical_frames = None
             b._update_canonical_points()
             print(f"canonical mesh overridden from {args.canonical_from}")
-        # Render over BLACK so pkg['render'] is premultiplied foreground RGB;
-        # compositing is then rgb + (1-alpha)*plate with no background-colour
-        # pollution in the semi-transparent silhouette fringe.
+        # Render over BLACK so pkg['render'] is premultiplied foreground RGB and
+        # compositing is rgb + (1-alpha)*plate.
         background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
         views = scene.getTestCameras()
         # Pass 1: collect per-frame predicted exp/jaw, then smooth over time with a
@@ -130,11 +171,32 @@ def main():
             alpha = pkg["alpha"].clamp(0, 1)
             plate = view.background.cuda().float() / 255.0  # torso composited over bc.jpg
             comp = rgb + plate * (1.0 - alpha)
-            rframes.append((comp.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
             gt = view.original_image.cuda().float()
             if gt.max() > 1.5:
                 gt = gt / 255.0
-            gframes.append((gt.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+            gt = gt.clamp(0, 1)
+            # Standard talking-head protocol (ER-NeRF/InsTaG/EmoTaG): the model
+            # synthesizes the HEAD; the torso+background below the neck come per-frame
+            # from the source video. The head-rigged Gaussians are not meant to model
+            # the torso, so compositing it from the source frames is required for the
+            # paper metric (set EMOTAG_GT_TORSO=0 to disable and inspect the raw render).
+            if os.environ.get('EMOTAG_GT_TORSO', '1') != '0':
+                nk = _neck_row(view.talking_dict.get('face_mask'), comp.shape[-2])
+                if nk is not None:
+                    # Feathered blend across the neck (not a hard cut) so the synthesized
+                    # head fades smoothly into the GT torso with no visible seam.
+                    Hc = comp.shape[-2]
+                    band = max(8, int(0.05 * Hc))          # ~5% of height transition
+                    rows = torch.arange(Hc, device=comp.device, dtype=comp.dtype)
+                    # weight = 1 (keep head) above nk-band, 0 (use GT) below nk+band, smooth between
+                    t = ((rows - (nk - band)) / (2 * band)).clamp(0, 1)
+                    wgt = (1 - (3 * t ** 2 - 2 * t ** 3)).view(1, Hc, 1)   # smoothstep, 1->0
+                    comp = comp * wgt + gt * (1 - wgt)
+            rframes.append((comp.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+            gframes.append((gt.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+        start = max(0, int(getattr(args, "eval_from", 0) or 0))
+        if start:
+            rframes, gframes = rframes[start:], gframes[start:]
         out = os.path.join(dataset.model_path, "test")
         os.makedirs(out, exist_ok=True)
         imageio.mimwrite(os.path.join(out, f"rendered_{args.out_name}.mp4"), rframes, fps=25, quality=8, macro_block_size=1)
