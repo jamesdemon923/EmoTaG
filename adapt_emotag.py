@@ -152,6 +152,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
+    _matte_cache = {}
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc='Training progress')
@@ -178,6 +179,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         face_mask = torch.as_tensor(unpack_bool_mask(viewpoint_cam.talking_dict['face_mask'])).cuda()
         hair_mask = torch.as_tensor(unpack_bool_mask(viewpoint_cam.talking_dict['hair_mask'])).cuda()
         head_mask = face_mask
+        # Supervision matte: prefer the tracker's tight foreground alpha
+        # (data/<ID>/matte/<img_id>.png) over the dilated parsing mask, whose extra
+        # band otherwise teaches the silhouette gaussians an opaque white rim.
+        soft_matte = None
+        _mp = os.path.join(dataset.source_path, 'matte', f"{viewpoint_cam.talking_dict['img_id']}.png")
+        if os.path.exists(_mp):
+            _mid = viewpoint_cam.talking_dict['img_id']
+            if _mid in _matte_cache:
+                soft_matte = _matte_cache[_mid]
+            else:
+                _m = np.array(Image.open(_mp)).astype(np.float32) / 255.0
+                if _m.ndim == 3:
+                    _m = _m[..., 0]
+                soft_matte = torch.from_numpy(_m).float().unsqueeze(0)
+                _matte_cache[_mid] = soft_matte
+            soft_matte = soft_matte.cuda()
         if iteration <= warm_up_iter:
             # First stabilize the identity-specific Gaussian appearance.
             if iteration == 1:
@@ -189,7 +206,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             visibility_filter = render_pkg['visibility_filter']
             radii = render_pkg['radii']
             gt_image_original = viewpoint_cam.original_image.cuda() / 255.0
-            gt_image = gt_image_original * head_mask + background[:, None, None] * ~head_mask
+            gt_image = (gt_image_original * soft_matte + background[:, None, None] * (1 - soft_matte)) \
+                if soft_matte is not None else \
+                (gt_image_original * head_mask + background[:, None, None] * ~head_mask)
             lambda_ssim = opt.lambda_dssim
             photo_l1_loss = l1_loss(rendered_image, gt_image)
             photo_ssim_loss = 1.0 - ssim(rendered_image, gt_image)
@@ -220,7 +239,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_exp_flat = gt_exp.squeeze()[:50]
             gt_jaw_flat = gt_jaw.squeeze()
             gt_image_original = viewpoint_cam.original_image.cuda() / 255.0
-            gt_image = gt_image_original * head_mask + background[:, None, None] * ~head_mask
+            gt_image = (gt_image_original * soft_matte + background[:, None, None] * (1 - soft_matte)) \
+                if soft_matte is not None else \
+                (gt_image_original * head_mask + background[:, None, None] * ~head_mask)
             lambda_ssim = opt.lambda_dssim
             photo_l1_loss = l1_loss(rendered_image, gt_image)
             photo_ssim_loss = 1.0 - ssim(rendered_image, gt_image)

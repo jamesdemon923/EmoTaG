@@ -91,6 +91,25 @@ python tools/crop_video.py --input raw.mp4 --output data/<ID>/<ID>.mp4
 
 ---
 
+### Evaluation data
+
+The processed evaluation scenes (11 neutral identities + MEAD emotional sets,
+ready for adaptation/evaluation without any preprocessing) are available here:
+
+### 📦 [**Download test data (Google Drive)**](https://drive.google.com/drive/folders/1zVB6NwWjVlXnZozIXUJxcjLVEMku9kNW?usp=drive_link)
+
+```bash
+tar xzf neutral_Obama.tar.gz -C data/
+# regenerate the Sapiens depth/normal priors (excluded from the archives for size;
+# deterministic, see Data Preparation Step 7):
+bash tools/run_sapiens_priors.sh data/neutral_Obama
+```
+
+`source_videos/` in the same folder holds the cropped 512×512 source clips for
+anyone who prefers to re-run the full preprocessing pipeline.
+
+---
+
 ## Data Preparation
 
 A **processed scene** contains calibrated images, FLAME tracking, Gaussian
@@ -312,7 +331,8 @@ python tools/render_composited.py \
 ```
 
 This writes `output/<ID>/test/rendered_comp.mp4` and the matching
-`gt_comp.mp4`. For a head-only green-screen preview use `synthesize.py`.
+`gt_comp.mp4`. Add `--bg_mode gt` to keep the source video's real background
+(when the scene has `bg_imgs/`, i.e. the original pre-matting frames).
 
 ---
 

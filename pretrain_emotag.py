@@ -145,7 +145,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
             gaussians.identity_feature = torch.from_numpy(np.load(identity_path).reshape(-1)).float().cuda()
         # Stable per-identity index selecting this identity's learnable code in render_motion.
         gaussians.identity_index = data_list.index(data_name)
-        # Persist the index so downstream rendering (synthesize.py) selects the same
+        # Persist the index so downstream rendering selects the same
         # per-identity code the scene was trained with.
         with open(os.path.join(_dataset.model_path, 'identity_index.txt'), 'w') as f:
             f.write(str(gaussians.identity_index))

@@ -1,10 +1,9 @@
-"""Paper-protocol rendering: audio-driven synthesis composited over the scene's
-static torso+background plate, evaluated against the ORIGINAL full frames.
+"""Paper-protocol rendering: the audio-driven head composited over the per-frame
+torso+background, evaluated against the original full frames.
 
 This matches the standard talking-head evaluation (ER-NeRF / InsTaG / EmoTaG
-paper): rendered head alpha-composited onto the per-frame torso+background,
-PSNR/SSIM/LPIPS computed on full frames. The green-screen comparison used by
-synthesize.py is a stricter internal debugging view, not the paper metric.
+paper): the model synthesizes the head; the torso and background come from the
+source frames, and PSNR/SSIM/LPIPS are computed on full frames.
 """
 import copy
 import os
@@ -20,6 +19,32 @@ from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import render_motion
 from scene import GaussianModel, MotionNetwork, Scene
 from scene.flame_wrapper import SimpleFlameWrapper
+
+
+def _person_matte(source_path, img_id, H):
+    """Per-frame person matte [1,H,W] in 0..1 from the scene's matting alphas
+    (data/<ID>/matte/<img_id>.png, the tracker's foreground masks). Used by
+    bg_mode gt to trim the silhouette: the avatar was trained against
+    white-matted frames through a dilated head mask, so its outermost silhouette
+    gaussians carry a white rim that only shows over a real background."""
+    p = os.path.join(source_path, "matte", f"{img_id}.png")
+    if not os.path.exists(p):
+        return None
+    from scipy.ndimage import gaussian_filter, grey_erosion
+    m = imageio.imread(p).astype(np.float32) / 255.0
+    if m.ndim == 3:
+        m = m[..., 0]
+    # Harden, erode a little, then feather: the matting alpha decays softly over the
+    # rim zone (~30% opacity), which would blend the white rim into the background
+    # as a milky halo. Binarizing at a high threshold and pulling the edge inward
+    # replaces the rim completely; the hair loses <=2px of soft wisps.
+    m = (m > 0.75).astype(np.float32)
+    m = grey_erosion(m, size=5)
+    m = gaussian_filter(m, sigma=1.2)
+    t = torch.from_numpy(m).float().unsqueeze(0)
+    if m.shape[0] != H:
+        t = torch.nn.functional.interpolate(t.unsqueeze(0), size=(H, H), mode="bilinear")[0]
+    return t.clamp(0, 1)
 
 
 def _neck_row(face_mask, H):
@@ -57,6 +82,11 @@ def main():
     parser.add_argument("--eval_from", type=int, default=0,
                         help="Write only frames >= this index (e.g. 125 = the held-out "
                              "test segment after a 5s/125-frame adaptation).")
+    parser.add_argument("--bg_mode", choices=["plate", "gt"], default="plate",
+                        help="plate (default): head over the scene's torso/background "
+                             "plate with the below-neck region from the source frames "
+                             "(the paper metric). gt: composite the head directly over "
+                             "the full source frame, keeping whatever background it has.")
     parser.add_argument("--drive_with_gt", action="store_true")
     parser.add_argument("--smooth_sigma", type=float, default=1.0,
                         help="Temporal Gaussian sigma (frames) for smoothing predicted jaw and mouth deltas; 0 disables.")
@@ -161,6 +191,11 @@ def main():
                 stacks = {k: np.stack([c[k].float().cpu().numpy() for c in collected]) for k in keys}
                 mouth_seq = {k: torch.tensor(gaussian_filter1d(v, sigma=sigma, axis=0)).float().cuda()
                              for k, v in stacks.items()}
+        # bg_mode gt prefers data/<ID>/bg_imgs/ — the original (pre-matting) frames with
+        # the real background, frame-aligned with the scene. Falls back to the matted
+        # GT frame when absent.
+        bg_dir = os.path.join(dataset.source_path, "bg_imgs")
+        use_bg_imgs = args.bg_mode == "gt" and os.path.isdir(bg_dir)
         rframes, gframes = [], []
         for vi, view in enumerate(views):
             dp = (smoothed[0][vi], smoothed[1][vi]) if smoothed is not None else None
@@ -170,16 +205,22 @@ def main():
             rgb = pkg["render"].clamp(0, 1)
             alpha = pkg["alpha"].clamp(0, 1)
             plate = view.background.cuda().float() / 255.0  # torso composited over bc.jpg
-            comp = rgb + plate * (1.0 - alpha)
             gt = view.original_image.cuda().float()
             if gt.max() > 1.5:
                 gt = gt / 255.0
             gt = gt.clamp(0, 1)
-            # Standard talking-head protocol (ER-NeRF/InsTaG/EmoTaG): the model
-            # synthesizes the HEAD; the torso+background below the neck come per-frame
-            # from the source video. The head-rigged Gaussians are not meant to model
-            # the torso, so compositing it from the source frames is required for the
-            # paper metric (set EMOTAG_GT_TORSO=0 to disable and inspect the raw render).
+            # bg_mode gt: the source frame itself is the backdrop, so the render keeps
+            # whatever background the video has. Default: the scene's torso/bc plate.
+            if use_bg_imgs:
+                bg_path = os.path.join(bg_dir, f"{view.talking_dict['img_id']}.jpg")
+                if os.path.exists(bg_path):
+                    gt = torch.from_numpy(imageio.imread(bg_path).astype(np.float32) / 255.0
+                                          ).permute(2, 0, 1).cuda().clamp(0, 1)
+            backdrop = gt if args.bg_mode == "gt" else plate
+            comp = rgb + backdrop * (1.0 - alpha)
+            # Standard protocol: the model synthesizes the head; torso+background
+            # below the neck come from the source frames (EMOTAG_GT_TORSO=0 disables,
+            # for inspecting the raw render).
             if os.environ.get('EMOTAG_GT_TORSO', '1') != '0':
                 nk = _neck_row(view.talking_dict.get('face_mask'), comp.shape[-2])
                 if nk is not None:
@@ -192,6 +233,13 @@ def main():
                     t = ((rows - (nk - band)) / (2 * band)).clamp(0, 1)
                     wgt = (1 - (3 * t ** 2 - 2 * t ** 3)).view(1, Hc, 1)   # smoothstep, 1->0
                     comp = comp * wgt + gt * (1 - wgt)
+            # Trim by the per-frame person matte (when matte/ exists): replaces any
+            # residual silhouette band with the backdrop.
+            pm = _person_matte(dataset.source_path, view.talking_dict['img_id'], comp.shape[-2])
+            if pm is not None:
+                pm = pm.to(comp.device)
+                outside = gt if args.bg_mode == "gt" else plate
+                comp = comp * pm + outside * (1 - pm)
             rframes.append((comp.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
             gframes.append((gt.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
         start = max(0, int(getattr(args, "eval_from", 0) or 0))

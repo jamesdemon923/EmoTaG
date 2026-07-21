@@ -62,3 +62,4 @@ data/*/
 !data/*.txt
 data_smoke/
 *.log
+.nfs*

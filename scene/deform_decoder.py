@@ -1,27 +1,11 @@
-"""Motion-feature-conditioned per-gaussian deformation + appearance prior.
+"""Motion-conditioned per-gaussian deformation + appearance prior (optional,
+enabled with EMOTAG_DEFORM=1).
 
-The FLAME-Gaussian avatar rides on a coarse parametric mesh whose 50-dim expression
-basis cannot reproduce every subject's exact per-frame face shape or its
-expression/pose-dependent shading. Static per-gaussian offsets only correct that
-residual for the expressions seen during the 5s adaptation clip, so held-out test
-frames render with an uncorrected residual (empirically the dominant few-shot error,
-concentrated at silhouette/jaw/brow edges).
-
-This decoder predicts a small per-gaussian position + colour correction conditioned
-on the GRMN's `encoded_motion` feature (the network's internal fused representation
-of audio + upper-face Action Units + identity). Crucially, `encoded_motion` is
-computed from the driving audio/AU in BOTH training and inference — it is never the
-tracked ground-truth expression — so the decoder sees the same signal at train and
-test time. An earlier revision conditioned on the FLAME expression, which is the
-teacher-forced GROUND-TRUTH during training but the noisy PREDICTED value at
-inference; that train/inference mismatch made the correction actively harmful. Using
-`encoded_motion` removes the mismatch, so the correction transfers.
-
-The weights are SHARED across identities (learned in pretraining) and modulated by a
-per-identity FiLM code, so a novel identity's 5s adaptation only fits the low-dim
-code. Both heads are zero-initialized (an untrained decoder is an exact no-op), and
-adaptation tunes only the code, so it cannot overfit the 125 adaptation frames the
-way a high-capacity per-identity module would.
+A decoder shared across identities predicts a small per-gaussian position and
+colour correction from (canonical position, GRMN motion feature, identity code).
+The motion feature comes from audio+AU in both training and inference, so the
+correction transfers to novel driving; adaptation fits only the low-dim identity
+code. Both heads are zero-initialized: an untrained decoder is an exact no-op.
 """
 import torch
 import torch.nn as nn

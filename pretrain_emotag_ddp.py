@@ -235,7 +235,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         # Stable per-identity index (position in the full scene list, identical across
         # ranks) used to select this identity's learnable code in render_motion.
         gaussians.identity_index = full_data_list.index(data_name)
-        # Persist the index so downstream rendering (synthesize.py) selects the same
+        # Persist the index so downstream rendering selects the same
         # per-identity code the scene was trained with.
         with open(os.path.join(_dataset.model_path, 'identity_index.txt'), 'w') as f:
             f.write(str(gaussians.identity_index))

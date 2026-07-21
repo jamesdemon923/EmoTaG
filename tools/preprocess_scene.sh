@@ -53,12 +53,14 @@ export VECLIB_MAXIMUM_THREADS=${EMOTAG_CPU_THREADS:-36}
 # at your VHAP checkout.
 export EMOTAG_VHAP_ROOT=${EMOTAG_VHAP_ROOT:-/path/to/VHAP}
 
-# Per-step interpreters. Defaults match the envs prepared on this machine.
-CONDA=/path/to/conda/envs
-EMOTAG_PY=${EMOTAG_PY:-$CONDA/instag/bin/python}
-AU_PY=${AU_PY:-$CONDA/pyfeat/bin/python}
-DEEPFACE_PY=${DEEPFACE_PY:-$CONDA/deepface/bin/python}
-ADAFACE_PY=${ADAFACE_PY:-$CONDA/cvlface/bin/python}
+# Per-step interpreters. EMOTAG_PY defaults to the python on PATH (the emotag
+# env); the feature extractors live in their own envs (see README Step 4-6) —
+# point AU_PY / DEEPFACE_PY / ADAFACE_PY at them, or leave unset to reuse
+# EMOTAG_PY if you installed those packages into one env.
+EMOTAG_PY=${EMOTAG_PY:-python}
+AU_PY=${AU_PY:-$EMOTAG_PY}
+DEEPFACE_PY=${DEEPFACE_PY:-$EMOTAG_PY}
+ADAFACE_PY=${ADAFACE_PY:-$EMOTAG_PY}
 
 # ---- 0. (optional) VHAP track + export ------------------------------------
 if [[ "${RUN_VHAP:-0}" == "1" ]]; then

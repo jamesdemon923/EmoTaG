@@ -127,11 +127,9 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     deformed_rotations = deformed_gaussians['rotation']
     w = curriculum_weight
     means3D = (1.0 - w) * canonical_xyz + w * deformed_xyz
-    # Expression-conditioned deformation prior: a shared decoder (pretrained across
-    # identities) predicts a small per-gaussian position correction for the FLAME
-    # per-frame registration residual that static offsets cannot capture on unseen
-    # expressions. Gated by the curriculum weight (only corrects the deformed state)
-    # and zero-init at pretrain start, so absent/untrained it is an exact no-op.
+    # Optional deformation prior (EMOTAG_DEFORM): a shared decoder predicts a small
+    # per-gaussian correction; zero-init and curriculum-gated, so absent/untrained it
+    # is an exact no-op.
     deform_decoder = getattr(pc, 'deform_decoder', None)
     _delta_color = None
     if deform_decoder is not None and w > 0:
