@@ -16,10 +16,8 @@ class SimpleFlameWrapper(nn.Module):
         super().__init__()
         self.device = device
         self.teeth = bool(add_teeth)
-        if flame_params_file is None:
-            raise ValueError('flame_params_file is required for loading FLAME parameters')
         self.flame_params_file = flame_params_file
-        self.all_flame_params = self._load_all_flame_params()
+        self.all_flame_params = self._load_all_flame_params() if flame_params_file else None
         self.flame_model = None
         self._load_flame_model(flame_model_path)
 

@@ -6,6 +6,7 @@
 #
 #   0. vhap_track_one.sh          (optional) VHAP track + export from a video
 #   1. import_vhap_export.py      VHAP export -> EmoTaG scene + FLAME/Gaussian init
+#                                 (+ bg_imgs/, matte/ from VHAP_FRAMES, set automatically with RUN_VHAP=1)
 #   2. extract_landmarks.py       real FAN 68-pt landmarks (ori_imgs/<id>.lms)
 #   3. extract_wav2vec2_features  audio features: copies WAV to <scene>/aud.wav, then
 #      + extract_whisper_features aud_w2v.npy and aud_whisper.npy (SKIP_WHISPER=1 to skip).
@@ -72,8 +73,9 @@ if [[ "${RUN_VHAP:-0}" == "1" ]]; then
   : "${VIDEO:?Set VIDEO to the source mp4 when RUN_VHAP=1.}"
   ID=$(basename "$scene")
   echo "[0] VHAP tracking $ID from $VIDEO"
-  export_line=$(bash tools/vhap_track_one.sh "$ID" "$VIDEO" | tee /dev/stderr | grep '^EXPORT=' | tail -1)
-  VHAP_EXPORT=${export_line#EXPORT=}
+  vhap_out=$(bash tools/vhap_track_one.sh "$ID" "$VIDEO" | tee /dev/stderr)
+  VHAP_EXPORT=$(grep '^EXPORT=' <<< "$vhap_out" | tail -1); VHAP_EXPORT=${VHAP_EXPORT#EXPORT=}
+  VHAP_FRAMES=${VHAP_FRAMES:-$(grep '^FRAMES=' <<< "$vhap_out" | tail -1)}; VHAP_FRAMES=${VHAP_FRAMES#FRAMES=}
 fi
 
 # ---- 1. Import VHAP export -------------------------------------------------
@@ -86,7 +88,8 @@ if [[ "${SKIP_IMPORT:-0}" != "1" ]]; then
     --output "$scene" \
     --flame_model_path "$EMOTAG_FLAME_MODEL" \
     --num_points "${NUM_POINTS:-60000}" \
-    --link_mode "${LINK_MODE:-copy}"
+    --link_mode "${LINK_MODE:-copy}" \
+    ${VHAP_FRAMES:+--frames_dir "$VHAP_FRAMES"}
 fi
 
 # ---- 2. Real landmarks -----------------------------------------------------

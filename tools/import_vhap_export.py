@@ -118,6 +118,18 @@ def make_background(image_path: Path, output_path: Path) -> None:
     bg = np.full((image.height, image.width, 3), 255, dtype=np.uint8)
     Image.fromarray(bg).save(output_path)
 
+def write_background_frames(frames_dir: Path, vhap_root: Path, frames: list[dict], output_root: Path) -> None:
+    """bg_imgs/<id>.jpg = original frames (VHAP preprocess images/<id:06d>.jpg), matte/<id>.png = VHAP foreground masks."""
+    (output_root / 'bg_imgs').mkdir(exist_ok=True)
+    (output_root / 'matte').mkdir(exist_ok=True)
+    for idx, frame in enumerate(frames):
+        frame_id = normalize_frame_id(frame, idx)
+        mask = frame_mask_path(vhap_root, frame)
+        if mask is None:
+            raise FileNotFoundError(f'No foreground mask for frame {frame_id} in {vhap_root}')
+        shutil.copy2(frames_dir / f'{frame_id:06d}.jpg', output_root / 'bg_imgs' / f'{frame_id}.jpg')
+        shutil.copy2(mask, output_root / 'matte' / f'{frame_id}.png')
+
 def selected_frames(transform_data: dict, max_frames: int | None) -> list[dict]:
     frames = list(transform_data.get('frames', []))
     if max_frames is not None:
@@ -186,6 +198,8 @@ def write_scene_files(args: argparse.Namespace) -> None:
         make_transparent_torso(width, height, output_root / 'torso_imgs' / f'{frame_id}.png')
     if first_image_path is None:
         raise RuntimeError('No frames were found in the VHAP export.')
+    if args.frames_dir:
+        write_background_frames(args.frames_dir, vhap_root, all_frames, output_root)
     make_background(first_image_path, output_root / 'bc.jpg')
     save_json(output_root / 'transforms.json', normalize_transform_data(transform_data, frames))
     if args.audio_features:
@@ -196,7 +210,7 @@ def write_scene_files(args: argparse.Namespace) -> None:
         zeros = np.zeros((num_frames, 16, args.audio_dim), dtype=np.float32)
         np.save(output_root / args.audio_output, zeros)
     from assets.flame_loader import generate_and_save_initial_mesh_data
-    generate_and_save_initial_mesh_data(flame_root=str(vhap_root / 'flame_param'), output_dir=str(output_root), flame_model=str(args.flame_model_path.resolve()), num_points=args.num_points)
+    generate_and_save_initial_mesh_data(flame_root=str(vhap_root / 'flame_param'), output_dir=str(output_root), flame_model=str(args.flame_model_path.absolute()), num_points=args.num_points)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Import a VHAP export as an EmoTaG processed scene.')
@@ -209,6 +223,9 @@ def main() -> int:
     parser.add_argument('--audio_features', type=Path, default=None)
     parser.add_argument('--audio_dim', type=int, default=768)
     parser.add_argument('--audio_output', type=str, default='aud_w2v.npy')
+    parser.add_argument('--frames_dir', type=Path, default=None,
+                        help='VHAP preprocess frames with the real background (<data root>/<ID>/images): '
+                             'also write bg_imgs/ and matte/ (needed by tools/render_composited.py)')
     parser.add_argument('--use_fallback_landmarks', action='store_true',
                         help='Write coarse synthetic .lms files for pipeline testing only. '
                              'For reproduction, leave this off and run tools/extract_landmarks.py.')

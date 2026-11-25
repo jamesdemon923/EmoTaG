@@ -51,6 +51,12 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
+def landmark_embedding_path(model_path: str) -> str:
+    """landmark_embedding.npy (or VHAP's landmark_embedding_with_eyes.npy) next to the FLAME model or its link target."""
+    cands = [os.path.join(d, n) for d in (os.path.dirname(model_path), os.path.dirname(os.path.realpath(model_path)))
+             for n in ('landmark_embedding.npy', 'landmark_embedding_with_eyes.npy')]
+    return next((c for c in cands if os.path.exists(c)), cands[0])
+
 class FlameDataProcessor:
     """
     Handles loading of FLAME parameters and generation of initial mesh data.
@@ -67,12 +73,17 @@ class FlameDataProcessor:
 
     def _create_simple_flame(self, model_path):
         """Creates a simplified FLAME model instance using VHAP's FlameHead."""
+        cwd = os.getcwd()
         try:
-            self.flame_model = FlameHead(shape_params=300, expr_params=100, flame_model_path=model_path, flame_lmk_embedding_path=os.path.join(os.path.dirname(model_path), 'landmark_embedding.npy'))
+            if VHAP_ROOT and os.path.isdir(os.path.join(VHAP_ROOT, 'asset', 'flame')):
+                os.chdir(VHAP_ROOT)  # FlameHead loads its template mesh by a path relative to the VHAP root
+            self.flame_model = FlameHead(shape_params=300, expr_params=100, flame_model_path=model_path, flame_lmk_embedding_path=landmark_embedding_path(model_path))
             self._mouth_vertex_indices = None
             self._mouth_face_indices = None
         except Exception as e:
             raise RuntimeError(f'Failed to create VHAP FlameHead from {model_path}: {e}')
+        finally:
+            os.chdir(cwd)
 
     def load_flame_params(self, data_root: str, frame_id: int) -> Dict[str, torch.Tensor]:
         """
@@ -161,8 +172,7 @@ class FlameDataProcessor:
         """Internal helper."""
         if self._mouth_vertex_indices is not None and self._mouth_face_indices is not None:
             return (self._mouth_vertex_indices, self._mouth_face_indices)
-        model_dir = os.path.dirname(self.flame_model_path)
-        lme_path = os.path.join(model_dir, 'landmark_embedding.npy')
+        lme_path = landmark_embedding_path(self.flame_model_path)
         if not os.path.exists(lme_path):
             print(f'landmark_embedding.npy not found at {lme_path}; mouth binding will be empty.')
             return (np.array([], dtype=np.int64), np.array([], dtype=np.int64))

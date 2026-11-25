@@ -337,7 +337,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                 ckpt = (motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
                 torch.save(ckpt, dataset.model_path + '/chkpnt_face_latest' + '.pth')
                 with ema_motion_net.average_parameters():
-                    ckpt_ema = (copy.deepcopy(motion_net.state_dict()), motion_optimizer.state_dict(), iteration)
+                    ckpt_ema = (dict(copy.deepcopy(motion_net.state_dict()), audio_extractor=dataset.audio_extractor), motion_optimizer.state_dict(), iteration)
                     torch.save(ckpt_ema, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
                 for _scene in scene_list:
                     _gaussians = _scene.gaussians
@@ -375,7 +375,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     ckpt = (motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
     torch.save(ckpt, dataset.model_path + '/chkpnt_face_latest' + '.pth')
     with ema_motion_net.average_parameters():
-        ckpt_ema = (copy.deepcopy(motion_net.state_dict()), motion_optimizer.state_dict(), iteration)
+        ckpt_ema = (dict(copy.deepcopy(motion_net.state_dict()), audio_extractor=dataset.audio_extractor), motion_optimizer.state_dict(), iteration)
         torch.save(ckpt_ema, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
     for _scene in scene_list:
         _gaussians = _scene.gaussians

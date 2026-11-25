@@ -12,12 +12,12 @@
 #
 # Defaults: video = HDTF/data_90/processed_videos/<ID>.mp4
 #           work_root = ./vhap_work
-# Output export folder is printed on the last line as: EXPORT=<path>
+# Output export folder is printed on the last line as: EXPORT=<path> (the frames with background: FRAMES=<path>)
 set -euo pipefail
 
 ID=${1:?Usage: bash tools/vhap_track_one.sh <ID> [video] [work_root]}
 VIDEO=${2:-/path/to/HDTF/processed_videos/${ID}.mp4}
-WORK=${3:-./vhap_work}
+WORK=$(realpath -m "${3:-./vhap_work}")   # absolute: the VHAP steps run from VHAP_DIR
 VHAP_DIR=${VHAP_DIR:-/path/to/VHAP}
 VHAP_ENV=${VHAP_ENV:-/path/to/conda/envs/VHAP}
 VHAP_PY=${VHAP_PY:-$VHAP_ENV/bin/python}
@@ -68,6 +68,17 @@ fi
 
 cd "$VHAP_DIR"
 
+# VHAP tracks with FLAME 2023 by default; EmoTaG decodes the tracking with FLAME 2020 (generic_model.pkl),
+# so track.py / export run with VHAP_FLAME_MODEL (path relative to the VHAP root) as FlameHead's model.
+VHAP_FLAME_MODEL=${VHAP_FLAME_MODEL:-asset/flame/generic_model.pkl}
+run_vhap() {
+  "$VHAP_PY" -c 'import runpy, sys
+import vhap.model.flame as F
+d = list(F.FlameHead.__init__.__defaults__); d[0] = F.FLAME_MODEL_PATH = sys.argv[1]
+F.FlameHead.__init__.__defaults__ = tuple(d)
+sys.argv = sys.argv[2:]; runpy.run_path(sys.argv[0], run_name="__main__")' "$VHAP_FLAME_MODEL" "$@"
+}
+
 if [[ ! -d "$SEQ_DIR/images" || -z "$(ls -A "$SEQ_DIR/images" 2>/dev/null)" ]]; then
   echo "[$ID] (1/3) preprocess_video"
   "$VHAP_PY" vhap/preprocess_video.py \
@@ -75,9 +86,11 @@ if [[ ! -d "$SEQ_DIR/images" || -z "$(ls -A "$SEQ_DIR/images" 2>/dev/null)" ]]; 
     --matting_method robust_video_matting
 fi
 
-if ! ls "$TRACK_OUT"/tracked_flame_params*.npz >/dev/null 2>&1; then
+# track.py writes into a time-stamped sub-folder of TRACK_OUT; use the latest one
+track_dir() { ls -d "$TRACK_OUT"/*/ 2>/dev/null | sort | tail -1; }
+if ! ls "$(track_dir)"/tracked_flame_params*.npz >/dev/null 2>&1; then
   echo "[$ID] (2/3) track"
-  "$VHAP_PY" vhap/track.py \
+  run_vhap vhap/track.py \
     --data.root_folder "$DATA_ROOT" \
     --data.sequence "$ID" \
     --exp.output_folder "$TRACK_OUT"
@@ -85,11 +98,12 @@ fi
 
 if [[ ! -f "$EXPORT_OUT/transforms.json" ]]; then
   echo "[$ID] (3/3) export"
-  "$VHAP_PY" vhap/export_as_nerf_dataset.py \
-    --src_folder "$TRACK_OUT" \
+  run_vhap vhap/export_as_nerf_dataset.py \
+    --src_folder "$(track_dir)" \
     --tgt_folder "$EXPORT_OUT" \
     --background-color white
 fi
 
 echo "[$ID] done"
+echo "FRAMES=$SEQ_DIR/images"
 echo "EXPORT=$EXPORT_OUT"

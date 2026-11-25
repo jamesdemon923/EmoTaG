@@ -18,10 +18,10 @@ EXTRACTOR_KEY = 'audio_extractor'
 
 
 def check_prior_extractor(state: dict, extractor: str, path: str = '') -> dict:
-    """Remove the audio-feature tag from a prior's state dict and stop if it does not match --audio_extractor."""
+    """Remove the audio-feature tag (untagged priors are Wav2Vec2 priors) and stop if it does not match --audio_extractor."""
     state = dict(state)
-    tag = state.pop(EXTRACTOR_KEY, None)
-    if tag is not None and tag != extractor:
+    tag = state.pop(EXTRACTOR_KEY, 'wav2vec2')
+    if tag != extractor:
         raise SystemExit(f'[EmoTaG] the motion prior {path} was trained on {tag} features: '
                          f'pass --audio_extractor {tag} (got {extractor}).')
     return state

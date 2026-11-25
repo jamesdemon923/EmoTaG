@@ -196,6 +196,8 @@ def main():
         scenes = args.scenes or sorted(os.path.basename(os.path.dirname(p))
                                        for p in glob.glob(os.path.join(args.output, '*', 'chkpnt_face_latest.pth')))
         for sc in scenes:
+            if not os.path.isdir(os.path.join(args.data, sc)):
+                continue
             m = os.path.join(args.output, sc)
             evaluate(m, sc, args.data, skip_lmd=args.skip_lmd, sync_data=args.sync_data, render_args=rargs)
             for kind, pairs in NOVEL.items():

@@ -60,6 +60,7 @@ pip install ./diff-gaussian-rasterization
 | [DeepFace](https://github.com/serengil/deepface) | Per-frame emotion features |
 | [CVLface](https://github.com/mk-minchul/CVLface) | Identity embedding |
 | [Sapiens](https://github.com/facebookresearch/sapiens/blob/main/lite/README.md) | Depth and normal priors for adaptation |
+| [SyncNet](https://github.com/joonson/syncnet_python) | Audio/video offset and lip-sync metrics (`SYNCNET_ROOT`) |
 
 Export the FLAME / VHAP paths used by the preprocessing tools:
 
@@ -101,22 +102,23 @@ ready for adaptation/evaluation without any preprocessing) are available here:
 
 ```bash
 tar xzf neutral_Obama.tar.gz -C data/
-# regenerate the Sapiens depth/normal priors (excluded from the archives for size;
-# deterministic, see Data Preparation Step 7):
+# regenerate the Sapiens depth/normal priors of adaptation scenes (excluded from the
+# archives for size; deterministic, see Data Preparation Step 7):
 bash tools/run_sapiens_priors.sh data/neutral_Obama
 ```
 
-See `README.txt` in the folder for its contents. The data were updated recently;
-if you downloaded them earlier, please download them again.
+See `README.txt` in the folder for its contents.
 
 ---
 
 ## Data Preparation
 
-A **processed scene** contains calibrated images, FLAME tracking, Gaussian
+These steps turn your own video into a processed scene (the released evaluation scenes
+above are already processed). A **processed scene** contains calibrated images, FLAME tracking, Gaussian
 initialization, audio features, AU features, the emotion teacher, and the
 identity descriptor. `tools/preprocess_scene.sh` runs all steps below for one
-scene; add `RUN_SAPIENS=1` for adaptation (target) scenes:
+scene (add `RUN_REFINE=1` for Step 4b, and `RUN_SAPIENS=1` for adaptation scenes); then fix
+the audio offset as in Step 3:
 
 ```bash
 EMOTAG_FLAME_MODEL=/path/to/FLAME/generic_model.pkl \
@@ -142,6 +144,8 @@ data/<ID>/
 ├── bary_coords.npy
 ├── vertices.npy
 ├── mouth_point_indices.npy
+├── aud.wav
+├── aud_whisper.npy
 ├── aud_w2v.npy
 ├── au_features.csv
 ├── emotion_features.npy      
@@ -180,9 +184,8 @@ python tools/extract_landmarks.py --scene data/<ID>
 
 ### Step 3 — Audio features (Whisper / Wav2Vec2)
 
-The released checkpoint uses Whisper features (multilingual); Wav2Vec2 features are only
-needed for the first-release checkpoint or for pre-training with
-[`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
+EmoTaG supports two audio encoders (`--audio_extractor whisper` or `wav2vec2`); the released
+checkpoint uses Whisper.
 
 ```bash
 python tools/extract_whisper_features.py \
@@ -194,7 +197,8 @@ python tools/extract_wav2vec2_features.py \
   --output     data/<ID>/aud_w2v.npy \
   --transforms data/<ID>/transforms.json
 
-# fix the audio-video offset (needs SYNCNET_ROOT=/path/to/syncnet_python)
+# fix the audio-video offset (needs SYNCNET_ROOT=/path/to/syncnet_python);
+# add --split_at 125 when the first 125 frames come from another take
 python tools/check_av_sync.py data/<ID> --fix
 ```
 
@@ -249,8 +253,11 @@ python tools/extract_adaface_identity.py \
 
 > Not required for pre-training.
 
+Put the Sapiens 0.3b TorchScript checkpoints ([depth](https://huggingface.co/facebook/sapiens-depth-0.3b-torchscript),
+[normal](https://huggingface.co/facebook/sapiens-normal-0.3b-torchscript)) into
+`tools/sapiens/checkpoint/sapiens-depth-0.3b-torchscript/` and `.../sapiens-normal-0.3b-torchscript/`, then:
+
 ```bash
-conda activate sapiens_lite
 bash tools/run_sapiens_priors.sh data/<ID>
 ```
 
@@ -324,27 +331,60 @@ To skip pre-training, download the multi-identity motion prior and adapt directl
 
 ### 📦 [**Download checkpoint (Google Drive)**](https://drive.google.com/drive/folders/17wgFUGF7pxbW3QlBkiHQzo3nYTzF-fiN?usp=drive_link)
 
-`chkpnt_ema_face_latest.pth` has been updated and now takes Whisper features
-(`--audio_extractor whisper`); please download it again.
-
 Pre-trained on quality-filtered HDTF identities
-(from [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt)) with the recipe
-in [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
+(from [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt)). Its audio-to-motion part was
+then further trained with Whisper audio features, which are multilingual and give better lip
+sync on non-English speech (next section).
+
+### Audio-to-motion training
+
+The released checkpoint continues the pre-trained one on FLAME tracks of talking-head videos (audio and
+FLAME parameters only, no images), in two stages: stage 1 learns the mapping from Whisper features on
+FaceForensics++, HDTF and TFHP; stage 2 continues on HDTF and TFHP after removing each clip's audio-video offset.
+
+Public data:
+- FaceForensics++ tracks: `D5_unitalker_faceforensics++` from the
+  [UniTalker data release V1](https://github.com/X-niper/UniTalker#download-data) (only this folder is used).
+- HDTF + TFHP tracks: the `HDTF_TFHP-lmdb` folder of
+  [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP) (requested through their form; `pip install lmdb`).
+- The [FLAME 2020](https://flame.is.tue.mpg.de) `generic_model.pkl`: both track sets use FLAME 2020 expressions,
+  which are mapped to the FLAME 2019 basis of EmoTaG.
+
+```bash
+F2020=/path/to/FLAME2020/generic_model.pkl
+python tools/prepare_audio_prior_data.py --source unitalker --root /path/to/D5_unitalker_faceforensics++ \
+  --flame2020 $F2020 --out data_prior/d5
+for i in 0 1 2 3; do
+  python tools/prepare_audio_prior_data.py --source diffposetalk --root /path/to/HDTF_TFHP-lmdb --flame2020 $F2020 \
+    --exclude data/audio_prior_exclude.txt --splits train --shard $i/4 --out data_prior/hdtf_tfhp
+done
+python tools/prepare_audio_prior_data.py --source diffposetalk --root /path/to/HDTF_TFHP-lmdb --flame2020 $F2020 \
+  --exclude data/audio_prior_exclude.txt --splits val --out data_prior/hdtf_tfhp
+
+python tools/train_audio_prior.py --init output/pretrain/chkpnt_ema_face_latest.pth \
+  --data data_prior/d5 data_prior/hdtf_tfhp --out output/prior/stage1.pth --steps 40000
+python tools/train_audio_prior.py --init output/prior/stage1.pth \
+  --data data_prior/hdtf_tfhp --out output/prior/chkpnt_ema_face_latest.pth --steps 30000 --w_vertex 1 --align --select aperture
+```
+
+`--init` is the pre-training checkpoint above. [`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) lists the
+speakers and recordings of the evaluation scenes, which are left out; the four train shards keep the clip order of our run.
+Each stage keeps its best checkpoint on the validation split (about 20 min per stage on one GPU). Adapt with
+`--pretrain_path output/prior/chkpnt_ema_face_latest.pth --audio_extractor whisper`.
 
 ---
 
 ## Inference
 
-Render the composited video (the synthesized head over the per-frame
-torso+background, the standard talking-head protocol):
+Render the composited video (the synthesized head over the source video's background,
+torso from the source frames, the standard talking-head protocol):
 
 ```bash
 python tools/render_composited.py -s data/<ID> -m output/<ID>
 ```
 
-This writes `output/<ID>/test/rendered_comp.mp4` and the matching
-`gt_comp.mp4`. Add `--bg_mode gt` to keep the source video's real background
-(when the scene has `bg_imgs/`, i.e. the original pre-matting frames).
+This writes `output/<ID>/test/rendered_comp_audio.mp4` (with audio), `rendered_comp.mp4` and
+the matching `gt_comp.mp4`.
 
 ---
 
@@ -359,10 +399,10 @@ python tools/render_composited.py -s data/<ID> -m output/<ID> --eval_from 125
 python evaluate_metrics.py video \
   output/<ID>/test/rendered_comp.mp4 \
   output/<ID>/test/gt_comp.mp4 \
-  output/<ID>/test
+  output/<ID>/test --masks output/<ID>/test/masks_comp.npz
 ```
 
-All test settings on the released scenes:
+All test settings on the released scenes (Sync-C/E need `SYNCNET_ROOT`):
 
 ```bash
 python tools/run_benchmark.py all --data data --output output       # models in output/<scene>

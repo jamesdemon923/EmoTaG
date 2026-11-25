@@ -1,0 +1,8 @@
+WDA_BarackObama
+WDA_JeanneShaheen
+WDA_TedLieu
+TH_00136/000
+TH_00285/000
+TH_00293/001
+WRA_RandPaul/000
+WRA_RogerWicker/002

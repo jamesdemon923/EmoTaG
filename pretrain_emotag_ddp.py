@@ -232,7 +232,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         if os.path.exists(ema_path):
             ema_ck = torch.load(ema_path, map_location='cpu', weights_only=False)
             _ema_net = copy.deepcopy(motion_net)
-            _ema_net.load_state_dict(ema_ck[0])
+            _ema_net.load_state_dict({k: v for k, v in ema_ck[0].items() if k != 'audio_extractor'})
             ema_motion_net.shadow_params = [p.detach().clone() for p in _ema_net.parameters()]
             del _ema_net
         deform_ck_path = os.path.join(checkpoint, 'chkpnt_deform_latest.pth')
@@ -415,7 +415,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                     ckpt = (motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
                     torch.save(ckpt, dataset.model_path + '/chkpnt_face_latest' + '.pth')
                     with ema_motion_net.average_parameters():
-                        ckpt_ema = (copy.deepcopy(motion_net.state_dict()), motion_optimizer.state_dict(), iteration)
+                        ckpt_ema = (dict(copy.deepcopy(motion_net.state_dict()), audio_extractor=dataset.audio_extractor), motion_optimizer.state_dict(), iteration)
                         torch.save(ckpt_ema, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
                     if deform_decoder is not None:
                         torch.save((deform_decoder.state_dict(), deform_optimizer.state_dict(), iteration),
@@ -459,7 +459,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         ckpt = (motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
         torch.save(ckpt, dataset.model_path + '/chkpnt_face_latest' + '.pth')
         with ema_motion_net.average_parameters():
-            ckpt_ema = (copy.deepcopy(motion_net.state_dict()), motion_optimizer.state_dict(), iteration)
+            ckpt_ema = (dict(copy.deepcopy(motion_net.state_dict()), audio_extractor=dataset.audio_extractor), motion_optimizer.state_dict(), iteration)
             torch.save(ckpt_ema, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
     for _scene in scene_list:
         _gaussians = _scene.gaussians
