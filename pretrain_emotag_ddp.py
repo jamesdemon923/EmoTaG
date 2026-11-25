@@ -29,20 +29,12 @@ import json
 from utils.visualize_utils import ImageDebugger, TrainingStatsTracker, FlameDebugger
 import torch.distributed as dist
 
-# ---- Multi-GPU (DDP) helpers -------------------------------------------------
-# Data-parallel pretraining: scenes are sharded across ranks, each rank trains a
-# private replica of the shared MotionNetwork on its scene subset, and the net's
-# gradients are all-reduced (averaged) each dynamic step so every rank's net
-# stays identical -- mathematically a larger effective batch over scenes. The
-# canonical single-GPU script (pretrain_emotag.py) is untouched.
 def _ddp_init():
-    """Init torch.distributed from torchrun env. Returns (rank, world_size, is_dist)."""
+    """Init torch.distributed from torchrun env."""
     if int(os.environ.get('WORLD_SIZE', '1')) <= 1:
         return 0, 1, False
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     torch.cuda.set_device(local_rank)
-    # Generous collective timeout so a slow step (densification / opacity reset on a
-    # large scene) does not trip the NCCL watchdog.
     import datetime as _dt
     dist.init_process_group(backend='nccl', init_method='env://', timeout=_dt.timedelta(hours=2))
     return dist.get_rank(), dist.get_world_size(), True
@@ -54,15 +46,6 @@ def _ddp_broadcast_module(module, src=0):
         dist.broadcast(b.data, src=src)
 
 def _ddp_average_grads(module, world_size):
-    # Every rank must issue the same all_reduce calls in the same order, so
-    # materialize a zero grad for any param whose grad is None this step (which
-    # params are None can differ across ranks). This keeps one all_reduce per param
-    # per step on all ranks.
-    # The per-identity code table is sharded by identity: each row is touched by at
-    # most one rank per step, so the all_reduce SUM already yields that row's full
-    # gradient and must NOT be divided by world_size.
-    # Identity-sharded tables (motion individual_codes, deform id_codes): each row is
-    # touched by at most one rank per step, so SUM already gives the full gradient.
     sharded = {getattr(module, 'individual_codes', None), getattr(module, 'id_codes', None)}
     for p in module.parameters():
         if p.grad is None:
@@ -151,12 +134,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     is_dist = world_size > 1
     is_main = (rank == 0)
     full_data_list = resolve_pretrain_scene_names(dataset)
-    # Optional load balancing (EMOTAG_BALANCE=1): scenes vary widely in frame count, and
-    # round-robin-by-name sharding leaves fast ranks idle at each all_reduce barrier
-    # waiting on the rank that drew the big scenes. Sorting by frame count before the
-    # round-robin split spreads the heavy scenes evenly across ranks. The order change
-    # only re-labels identity_index (a consistent bijection), which does not affect the
-    # shared motion/deform weights that get delivered.
     if os.environ.get('EMOTAG_BALANCE') == '1':
         import json as _json
         def _nframes(name):
@@ -171,10 +148,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         print(f'[rank {rank}/{world_size}] handling {len(data_list)} scenes: {data_list}', flush=True)
     else:
         data_list = full_data_list
-    # All iteration boundaries must be identical across ranks, otherwise ranks cross
-    # the warmup->dynamic boundary at different steps and the shared-motion gradient
-    # all_reduce desyncs. len(data_list) can differ when scenes do not divide evenly
-    # by world_size, so derive the schedule from a consistent per-rank scene count.
     iters_scene_count = (len(full_data_list) + world_size - 1) // world_size
     warm_up_iter = opt.warm_up_iter_per_scene * iters_scene_count
     new_densify_from_iter = warm_up_iter + 100
@@ -189,13 +162,10 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     first_iter = 0
     motion_net = MotionNetwork(args=dataset).cuda()
     if is_dist:
-        # All ranks start from rank 0's weights so synced grads keep them identical.
         _ddp_broadcast_module(motion_net, src=0)
     motion_optimizer = torch.optim.AdamW(motion_net.get_params(0.005, 5e-05), betas=(0.9, 0.99), eps=1e-08)
     scheduler = torch.optim.lr_scheduler.LambdaLR(motion_optimizer, lambda iter: 0.1 ** (iter / opt.iterations))
     ema_motion_net = ExponentialMovingAverage(motion_net.parameters(), decay=0.995)
-    # Expression-conditioned deformation prior (shared across identities). Gated on
-    # EMOTAG_DEFORM so the default pretrain is byte-for-byte unchanged when disabled.
     deform_decoder = None
     deform_optimizer = None
     ema_deform = None
@@ -227,16 +197,11 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         flame_wrapper = SimpleFlameWrapper(flame_params_file=flame_params_file).cuda()
         gaussians = GaussianModel(dataset)
         gaussians.flame_wrapper = flame_wrapper
-        gaussians.deform_decoder = deform_decoder  # shared instance (None when disabled)
-        # AdaFace identity descriptor.
+        gaussians.deform_decoder = deform_decoder
         identity_path = os.path.join(_dataset.source_path, 'identity_feature.npy')
         if os.path.exists(identity_path):
             gaussians.identity_feature = torch.from_numpy(np.load(identity_path).reshape(-1)).float().cuda()
-        # Stable per-identity index (position in the full scene list, identical across
-        # ranks) used to select this identity's learnable code in render_motion.
         gaussians.identity_index = full_data_list.index(data_name)
-        # Persist the index so downstream rendering selects the same
-        # per-identity code the scene was trained with.
         with open(os.path.join(_dataset.model_path, 'identity_index.txt'), 'w') as f:
             f.write(str(gaussians.identity_index))
         _dataset.model_center = model_center
@@ -257,38 +222,33 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
             gaussians.mouth_mask = mouth_mask
         except Exception as e:
             sys.exit(1)
-    # Resume from a previous run of THIS script (same scene list and world size):
-    # --start_checkpoint <model_path of the interrupted run>. Restores the motion
-    # net + its optimizer + EMA shadow (root checkpoints) and every scene's
-    # gaussians incl. their optimizer state, densified binding and mouth mask
-    # (per-scene checkpoints), then fast-forwards the LR schedulers. Only the
-    # densification stat accumulators restart (they rebuild within ~100 steps).
     if checkpoint:
-        root_ck = torch.load(os.path.join(checkpoint, 'chkpnt_face_latest.pth'), map_location='cpu')
+        root_ck = torch.load(os.path.join(checkpoint, 'chkpnt_face_latest.pth'), map_location='cpu', weights_only=False)
         motion_state, motion_opt_state, ckpt_iteration = root_ck[0], root_ck[1], int(root_ck[2])
+        motion_state = {k: v for k, v in motion_state.items() if k != 'audio_extractor'}
         motion_net.load_state_dict(motion_state)
         motion_optimizer.load_state_dict(motion_opt_state)
         ema_path = os.path.join(checkpoint, 'chkpnt_ema_face_latest.pth')
         if os.path.exists(ema_path):
-            ema_ck = torch.load(ema_path, map_location='cpu')
+            ema_ck = torch.load(ema_path, map_location='cpu', weights_only=False)
             _ema_net = copy.deepcopy(motion_net)
             _ema_net.load_state_dict(ema_ck[0])
             ema_motion_net.shadow_params = [p.detach().clone() for p in _ema_net.parameters()]
             del _ema_net
         deform_ck_path = os.path.join(checkpoint, 'chkpnt_deform_latest.pth')
         if deform_decoder is not None and os.path.exists(deform_ck_path):
-            deform_ck = torch.load(deform_ck_path, map_location='cpu')
+            deform_ck = torch.load(deform_ck_path, map_location='cpu', weights_only=False)
             deform_decoder.load_state_dict(deform_ck[0])
             deform_optimizer.load_state_dict(deform_ck[1])
             ema_dpath = os.path.join(checkpoint, 'chkpnt_deform_ema_latest.pth')
             if os.path.exists(ema_dpath):
                 _ema_d = copy.deepcopy(deform_decoder)
-                _ema_d.load_state_dict(torch.load(ema_dpath, map_location='cpu')[0])
+                _ema_d.load_state_dict(torch.load(ema_dpath, map_location='cpu', weights_only=False)[0])
                 ema_deform.shadow_params = [p.detach().clone() for p in _ema_d.parameters()]
                 del _ema_d
         for _scene, _name in zip(scene_list, data_list):
             scene_ck_path = os.path.join(checkpoint, _name, 'chkpnt_face_latest.pth')
-            scene_ck = torch.load(scene_ck_path, map_location='cuda')
+            scene_ck = torch.load(scene_ck_path, map_location='cuda', weights_only=False)
             if int(scene_ck[3]) != ckpt_iteration:
                 raise RuntimeError(f'Resume mismatch: {scene_ck_path} is at iter {scene_ck[3]}, root at {ckpt_iteration}')
             _scene.gaussians.restore(scene_ck[0], opt)
@@ -302,9 +262,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     iter_end = torch.cuda.Event(enable_timing=True)
     viewpoint_stack = None
     ema_loss_for_log = 0.0
-    # Per-scene optimizer-step counters: densification/opacity-reset cadences are
-    # defined in per-scene steps (as in single-scene 3DGS), not global steps.
-    # On resume, approximate the counters so the per-scene reset cadence stays aligned.
     scene_own_steps = [first_iter // max(1, len(scene_list)) for _ in scene_list]
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc='Training progress')
     first_iter += 1
@@ -333,7 +290,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
         hair_mask = torch.as_tensor(unpack_bool_mask(viewpoint_cam.talking_dict['hair_mask'])).cuda()
         head_mask = face_mask
         if iteration <= warm_up_iter:
-            # Warm up the Gaussian avatar before enabling audio-driven motion.
             if iteration == 1:
                 print('Starting static warm-up stage.')
             render_pkg = render(viewpoint_cam, gaussians, pipe, background)
@@ -350,7 +306,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
             loss = (1.0 - lambda_ssim) * photo_l1_loss + lambda_ssim * photo_ssim_loss
             loss.backward()
         else:
-            # Blend from static rendering to the full motion network with a short curriculum.
             if iteration == warm_up_iter + 1:
                 print('Starting dynamic motion stage.')
             if iteration < curriculum_start_iter:
@@ -383,9 +338,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
             photo_l1_loss = l1_loss(rendered_image, gt_image)
             photo_ssim_loss = 1.0 - ssim(rendered_image, gt_image)
             rendering_loss = (1.0 - lambda_ssim) * photo_l1_loss + lambda_ssim * photo_ssim_loss
-            # Mouth-crop supervision: the intra-oral region is a tiny fraction of the
-            # frame and gets almost no gradient share from full-frame losses; weight
-            # the lips_rect crop so the mouth branch/teeth learn real detail.
             if getattr(opt, 'w_mouth_crop', 0) > 0:
                 _mx0, _mx1, _my0, _my1 = viewpoint_cam.talking_dict['lips_rect']
                 _mx0, _mx1 = max(0, int(_mx0)), min(rendered_image.shape[1], int(_mx1))
@@ -395,15 +347,10 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                         rendered_image[:, _mx0:_mx1, _my0:_my1], gt_image[:, _mx0:_mx1, _my0:_my1])
             flame_exp_loss = F.mse_loss(pred_exp_flat, gt_exp_flat)
             flame_jaw_loss = F.mse_loss(pred_jaw_flat, gt_jaw_flat)
-            # Jaw is THE lip-sync driver but its MSE (radians, ~1e-3) is drowned by the
-            # 50-dim expression MSE (~0.2-0.8); unweighted, the jaw regression tends to
-            # collapse toward the mean. Reweight so the jaw term matches the
-            # rendering-loss scale.
             flame_reg_loss = flame_exp_loss + opt.w_jaw_reg * flame_jaw_loss
             w_rendering = 1.0
             w_flame_reg = opt.w_flame_reg
             loss = w_rendering * rendering_loss + w_flame_reg * flame_reg_loss
-            # Semantic Emotion Guidance (KL + score distillation).
             emo_target = viewpoint_cam.talking_dict.get('emotion', None)
             if emo_target is not None:
                 seg_loss, _, _ = semantic_emotion_guidance_loss(render_pkg.get('emotion_logits'), render_pkg.get('gate'), emo_target, viewpoint_cam.talking_dict.get('emotion_score', 0.0), w_kl=opt.w_emotion_kl, w_score=opt.w_emotion_score)
@@ -434,15 +381,7 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    # min_opacity must stay BELOW the opacity-reset value (0.01) or the reset
-                    # immediately mass-prunes every gaussian (-> 0 gaussians -> rasterizer crash).
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                # Standard 3DGS opacity reset, but counted in the scene's OWN optimizer
-                # steps. Resetting every scene on the global interval gives each scene only
-                # ~interval/len(scene_list) of its own steps to recover opacity before the
-                # next reset -> gaussians stay permanently translucent -> soft, washed-out
-                # renders. With per-scene counting each scene gets the full interval to
-                # re-justify its gaussians, exactly like single-scene 3DGS.
                 if cur_scene_own_step % opt.opacity_reset_interval == 0:
                     gaussians.reset_opacity()
             if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
@@ -459,8 +398,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 if iteration > warm_up_iter:
                     if is_dist:
-                        # Average the shared motion-net grads across ranks so the
-                        # synchronized step keeps every replica identical.
                         _ddp_average_grads(motion_net, world_size)
                     motion_optimizer.step()
                     motion_optimizer.zero_grad(set_to_none=True)
@@ -481,7 +418,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
                         ckpt_ema = (copy.deepcopy(motion_net.state_dict()), motion_optimizer.state_dict(), iteration)
                         torch.save(ckpt_ema, dataset.model_path + '/chkpnt_ema_face_latest' + '.pth')
                     if deform_decoder is not None:
-                        # Raw (for exact resume) + EMA (released/adaptation prior).
                         torch.save((deform_decoder.state_dict(), deform_optimizer.state_dict(), iteration),
                                    dataset.model_path + '/chkpnt_deform_latest.pth')
                         with ema_deform.average_parameters():
@@ -495,7 +431,6 @@ def training(dataset, opt, pipe, saving_iterations, checkpoint_iterations, check
     image_debugger.save_final_images()
     print('\n[FINAL] Saving final deformed Gaussians for the first 10 frames of each scene...')
     with torch.no_grad():
-        # Save compact geometry snapshots for quick inspection.
         for i, scene_to_save in enumerate(scene_list):
             scene_name = data_list[i]
             train_cameras = scene_to_save.getTrainCameras()
@@ -556,7 +491,7 @@ if __name__ == '__main__':
         dataset_args = lp.extract(args)
         scene_names = resolve_pretrain_scene_names(dataset_args)
         sys.exit(0)
-    safe_state(args.quiet)  # NOTE: safe_state forces cuda:0; call _ddp_init() AFTER it so each rank keeps its own device.
+    safe_state(args.quiet)
     _ddp_init()
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.share_audio_net)

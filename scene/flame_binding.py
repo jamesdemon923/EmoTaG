@@ -16,23 +16,10 @@ def dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.sum(x * y, -1, keepdim=True)
 
 class FLAMEBinding(nn.Module):
-    """
-    A new, correct implementation of FLAMEBinding based on barycentric coordinates.
-    This version accepts pre-computed binding info to avoid alignment issues.
-    """
+    """A new, correct implementation of FLAMEBinding based on barycentric coordinates."""
 
     def __init__(self, flame_model, face_indices, bary_coords, canonical_vertices, device='cuda'):
-        """
-        Initializes the binding with pre-computed face indices and barycentric coordinates.
-        This bypasses the need for ICP alignment.
-        
-        Args:
-            flame_model: The FLAME wrapper instance.
-            face_indices (torch.Tensor): Tensor of shape [N,] with the face index for each Gaussian.
-            bary_coords (torch.Tensor): Tensor of shape [N, 3] with the barycentric coordinates for each Gaussian.
-            canonical_vertices (torch.Tensor): The original mesh vertices used for sampling (not necessarily centered).
-            device (str): The target device for tensors.
-        """
+        """Initializes the binding with pre-computed face indices and barycentric coordinates."""
         super().__init__()
         self.device = device
         self.flame_model = flame_model
@@ -42,8 +29,6 @@ class FLAMEBinding(nn.Module):
         self.register_buffer('bary_coords', bary_coords.float().to(device))
         self.register_buffer('canonical_mesh_vertices', canonical_vertices.float().to(device))
         self.register_buffer('canonical_points', self.get_points_from_bary_coords(self.canonical_mesh_vertices))
-        # Per-face canonical frames (center/orientation/size); the canonical mesh is
-        # fixed, so these are computed once and reused by the local parameterization.
         self._canonical_frames = None
 
     def canonical_face_frames(self):
@@ -75,9 +60,7 @@ class FLAMEBinding(nn.Module):
         return transformed_xyz
 
     def update_binding(self, operation_type, mask, N=None):
-        """
-        Updates the binding information based on densification or pruning operations.
-        """
+        """Updates the binding information based on densification or pruning operations."""
         if operation_type == 'clone':
             cloned_face_indices = self.face_indices[mask]
             cloned_bary_coords = self.bary_coords[mask]
@@ -86,8 +69,8 @@ class FLAMEBinding(nn.Module):
         elif operation_type == 'split':
             if N is None:
                 raise ValueError("N must be provided for 'split' operation.")
-            split_face_indices = self.face_indices[mask].repeat_interleave(N, dim=0)
-            split_bary_coords = self.bary_coords[mask].repeat_interleave(N, dim=0)
+            split_face_indices = self.face_indices[mask].repeat(N)
+            split_bary_coords = self.bary_coords[mask].repeat(N, 1)
             self.face_indices = torch.cat([self.face_indices, split_face_indices])
             self.bary_coords = torch.cat([self.bary_coords, split_bary_coords])
         elif operation_type == 'prune':
@@ -98,24 +81,18 @@ class FLAMEBinding(nn.Module):
             raise ValueError(f'Unsupported binding operation: {operation_type}')
         self._update_canonical_points()
 
+    def append(self, face_indices, bary_coords):
+        """Bind additional gaussians (appended after the existing ones)."""
+        self.face_indices = torch.cat([self.face_indices, face_indices.long().to(self.face_indices.device)])
+        self.bary_coords = torch.cat([self.bary_coords, bary_coords.to(self.bary_coords)])
+        self._update_canonical_points()
+
     def _update_canonical_points(self):
-        """
-        Recalculates and updates the canonical_points buffer based on the current binding.
-        """
+        """Recalculates and updates the canonical_points buffer based on the current binding."""
         self.canonical_points = self.get_points_from_bary_coords(self.canonical_mesh_vertices)
 
     def get_points_on_surface(self, flame_verts):
-        """
-        Calculates the 3D positions of the Gaussian points on the surface of a deformed FLAME mesh.
-
-        Args:
-            flame_verts (torch.Tensor): The deformed vertices of the FLAME mesh, shape [V, 3], 
-                                      where V is the number of vertices.
-
-        Returns:
-            torch.Tensor: The calculated 3D positions of the Gaussian points on the mesh surface,
-                          shape [N, 3], where N is the number of Gaussian points.
-        """
+        """Calculates the 3D positions of the Gaussian points on the surface of a deformed FLAME mesh."""
         triangle_verts = flame_verts[self.faces[self.face_indices]]
         points_on_surface = (triangle_verts * self.bary_coords.unsqueeze(-1)).sum(dim=1)
         return points_on_surface

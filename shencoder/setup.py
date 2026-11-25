@@ -1,4 +1,5 @@
 import os
+import torch
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 _src_path = os.path.dirname(os.path.abspath(__file__))

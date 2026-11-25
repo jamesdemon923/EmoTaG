@@ -1,3 +1,4 @@
+import os
 import torch
 import math
 import torch.nn.functional as F
@@ -8,11 +9,7 @@ from scene.motion_net import MotionNetwork
 from utils.sh_utils import eval_sh
 import numpy as np
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
+    """Render the scene."""
     canonical_xyz = pc.get_canonical_xyz
     screenspace_points = torch.zeros_like(canonical_xyz, dtype=canonical_xyz.dtype, requires_grad=True, device='cuda') + 0
     try:
@@ -50,35 +47,31 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     rendered_image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(means3D=means3D, means2D=means2D, shs=shs, colors_precomp=colors_precomp, opacities=opacity, scales=scales, rotations=rotations, cov3Ds_precomp=cov3D_precomp, extra_attrs=torch.ones_like(opacity))
     return {'render': rendered_image, 'viewspace_points': screenspace_points, 'visibility_filter': radii > 0, 'depth': rendered_depth, 'alpha': rendered_alpha, 'normal': rendered_norm, 'radii': radii}
 
-def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, debug_viz=True, curriculum_weight=1.0, drive_with_gt=False, drive_params=None, mouth_params=None, return_motion_only=False):
-    """
-    Render the scene using the new FLAME-driven architecture.
-    """
+def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, debug_viz=True, curriculum_weight=1.0, drive_with_gt=False, drive_params=None, mouth_params=None, return_motion_only=False, preds=None):
+    """Render the scene using the new FLAME-driven architecture."""
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     raster_settings = GaussianRasterizationSettings(image_height=int(viewpoint_camera.image_height), image_width=int(viewpoint_camera.image_width), tanfovx=tanfovx, tanfovy=tanfovy, bg=bg_color, scale_modifier=scaling_modifier, viewmatrix=viewpoint_camera.world_view_transform, projmatrix=viewpoint_camera.full_proj_transform, sh_degree=pc.active_sh_degree, campos=viewpoint_camera.camera_center, prefiltered=False, debug=pipe.debug)
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     audio_feat = viewpoint_camera.talking_dict['auds'].cuda()
-    au_feat = viewpoint_camera.talking_dict['au_features'].cuda()
+    au_feat = viewpoint_camera.talking_dict.get('au_window', viewpoint_camera.talking_dict['au_features']).cuda()
     identity_feat = getattr(pc, 'identity_feature', None)
     if identity_feat is not None:
         identity_feat = identity_feat.cuda()
-    # Per-identity learnable code: gives each pretrain identity dedicated capacity so
-    # the shared motion network is not forced to average across all of them.
     ind_code = None
     if getattr(motion_net, 'individual_dim', 0) > 0:
         _idx = int(getattr(pc, 'identity_index', 0))
-        ind_code = motion_net.individual_codes[_idx:_idx + 1]
-    preds = motion_net(audio_feat, c=ind_code, au=au_feat, identity=identity_feat)
+        ind_code = motion_net.identity_code(_idx)
+    if preds is None:
+        preds = motion_net(audio_feat, c=ind_code, au=au_feat, identity=identity_feat)
     pred_exp_raw = preds['flame_exp']
     pred_jaw_raw = preds['flame_jaw']
+    pred_exp_window = pred_exp_raw if pred_exp_raw.dim() > 1 else pred_exp_raw.unsqueeze(0)
+    pred_jaw_window = pred_jaw_raw if pred_jaw_raw.dim() > 1 else pred_jaw_raw.unsqueeze(0)
     if pred_exp_raw.dim() == 1:
         pred_exp_raw = pred_exp_raw.unsqueeze(0)
     if pred_jaw_raw.dim() == 1:
         pred_jaw_raw = pred_jaw_raw.unsqueeze(0)
-    # The audio window holds per-frame predictions for frames [t-4, t+4); use the
-    # center frame's prediction rather than averaging, which would low-pass the
-    # articulation timing. The encoder still attends over the whole window as context.
     if pred_exp_raw.shape[0] > 1:
         pred_exp_raw = pred_exp_raw[pred_exp_raw.shape[0] // 2].unsqueeze(0)
     if pred_jaw_raw.shape[0] > 1:
@@ -96,18 +89,9 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
         gt_pose = gt_pose.unsqueeze(0)
     gt_global_rot = gt_pose[:, :3]
     if drive_with_gt:
-        # Appearance optimization uses the tracked FLAME parameters so the deformed
-        # geometry is aligned with the target frame; the motion network still trains
-        # through the parameter-regression / SEG losses computed from `preds` above.
-        # Driving the photometric loss with the (imperfect) predicted parameters
-        # supervises the gaussians through misaligned geometry every step, and the
-        # optimum of that objective is a motion-blurred average texture.
         drive_exp = gt_exp_feat[:, :50]
         drive_jaw = gt_pose[:, 3:]
     elif drive_params is not None:
-        # Externally supplied (e.g. temporally smoothed) expression/jaw: inference
-        # smooths the per-frame predictions over time to suppress frame-to-frame
-        # parameter tremor without touching articulation timing.
         drive_exp, drive_jaw = drive_params
         if drive_exp.dim() == 1:
             drive_exp = drive_exp.unsqueeze(0)
@@ -127,16 +111,11 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     deformed_rotations = deformed_gaussians['rotation']
     w = curriculum_weight
     means3D = (1.0 - w) * canonical_xyz + w * deformed_xyz
-    # Optional deformation prior (EMOTAG_DEFORM): a shared decoder predicts a small
-    # per-gaussian correction; zero-init and curriculum-gated, so absent/untrained it
-    # is an exact no-op.
     deform_decoder = getattr(pc, 'deform_decoder', None)
     _delta_color = None
     if deform_decoder is not None and w > 0:
         _didx = int(getattr(pc, 'identity_index', 0))
-        _dcode = getattr(pc, 'deform_code', None)  # novel identity (adaptation) overrides the table
-        # Condition on the GRMN motion feature (from audio+AU): identical at train and
-        # inference (never the teacher-forced GT expression), so the correction transfers.
+        _dcode = getattr(pc, 'deform_code', None)
         _mfeat = preds.get('encoded_motion', None)
         if _mfeat is None:
             _mfeat = preds.get('encoded_audio', None)
@@ -150,19 +129,15 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
     cov3D_precomp = None
     colors_precomp = None
     shs = pc.get_features
-    # Expression-conditioned appearance correction: the decoder's colour head offsets
-    # the DC-SH term so expression/pose-dependent shading (wrinkles, self-shadow) that
-    # the static per-gaussian colour cannot represent is added back per frame.
     if _delta_color is not None:
         shs = shs.clone()
         shs[:, 0, :] = shs[:, 0, :] + w * _delta_color
     mouth_pred = None
     mouth_mask = getattr(pc, 'mouth_mask', None)
+    if getattr(pc, 'intraoral_rigid', False):
+        mouth_mask = None
     if mouth_mask is not None and mouth_mask.numel() == means3D.shape[0] and mouth_mask.any():
         if mouth_params is not None:
-            # Externally supplied (e.g. temporally smoothed) intra-oral deltas: the
-            # triplane branch predicts them per frame from audio, so they carry the
-            # same frame-to-frame tremor as the expression head.
             mouth_pred = mouth_params
         else:
             mouth_pred = motion_net.forward_mouth(xyz=means3D, a=audio_feat, mouth_mask=mouth_mask, c=ind_code, encoded_audio=encoded_audio_feat)
@@ -193,7 +168,6 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
             mouth_scale_delta = pc.scaling_activation(weighted_d_scale)
             scales[mouth_mask] = scales[mouth_mask] * mouth_scale_delta
     if return_motion_only:
-        # Scene without an intra-oral subset: nothing further to collect.
         return {'predicted_flame_exp': pred_exp, 'predicted_flame_jaw': pred_jaw, 'mouth_pred': None}
     screenspace_points = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device='cuda') + 0
     if screenspace_points.requires_grad:
@@ -203,5 +177,5 @@ def render_motion(viewpoint_camera, pc: GaussianModel, motion_net: MotionNetwork
             pass
     means2D = screenspace_points
     rendered_image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(means3D=means3D, means2D=means2D, shs=shs, colors_precomp=colors_precomp, opacities=opacity, scales=scales, rotations=rotations, cov3Ds_precomp=None)
-    return_dict = {'render': rendered_image, 'viewspace_points': screenspace_points, 'visibility_filter': radii > 0, 'depth': rendered_depth, 'alpha': rendered_alpha, 'normal': rendered_norm, 'radii': radii, 'predicted_flame_exp': pred_exp_raw, 'predicted_flame_jaw': pred_jaw_raw, 'gt_flame_exp': gt_exp_feat, 'gt_flame_pose': gt_pose, 'deformed_flame_verts': flame_verts, 'deformed_xyz': means3D, 'deformed_rotations': rotations, 'deformed_raw_scale': deformed_gaussians['raw_scale'], 'gate': preds.get('gate'), 'emotion_logits': preds.get('emotion_logits')}
+    return_dict = {'render': rendered_image, 'viewspace_points': screenspace_points, 'visibility_filter': radii > 0, 'depth': rendered_depth, 'alpha': rendered_alpha, 'normal': rendered_norm, 'radii': radii, 'predicted_flame_exp': pred_exp_raw, 'predicted_flame_jaw': pred_jaw_raw, 'predicted_flame_exp_window': pred_exp_window, 'predicted_flame_jaw_window': pred_jaw_window, 'gt_flame_exp': gt_exp_feat, 'gt_flame_pose': gt_pose, 'deformed_flame_verts': flame_verts, 'deformed_xyz': means3D, 'deformed_rotations': rotations, 'deformed_raw_scale': deformed_gaussians['raw_scale'], 'gate': preds.get('gate'), 'emotion_logits': preds.get('emotion_logits')}
     return return_dict

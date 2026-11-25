@@ -29,7 +29,9 @@ RUN_FILE='./tools/sapiens/lite/demo/vis_normal.py'
 
 # JOBS_PER_GPU=1; TOTAL_GPUS=8; VALID_GPU_IDS=(0 1 2 3 4 5 6 7)
 # JOBS_PER_GPU=1; TOTAL_GPUS=1; VALID_GPU_IDS=(0)
-JOBS_PER_GPU=1; TOTAL_GPUS=4; VALID_GPU_IDS=(0 1 2 3)
+# GPUs are taken from SAPIENS_GPUS (space-separated ids), default "0".
+read -r -a VALID_GPU_IDS <<< "${SAPIENS_GPUS:-0}"
+JOBS_PER_GPU=1; TOTAL_GPUS=${#VALID_GPU_IDS[@]}
 
 BATCH_SIZE=2
 

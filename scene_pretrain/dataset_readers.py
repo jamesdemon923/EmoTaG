@@ -67,9 +67,7 @@ def fetchPly(path):
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def fetchBindingData(path):
-    """
-    Load binding information from .npy files.
-    """
+    """Load binding information from .npy files."""
     try:
         face_indices = np.load(os.path.join(path, 'face_indices.npy'))
         bary_coords = np.load(os.path.join(path, 'bary_coords.npy'))
@@ -101,22 +99,21 @@ def loadAUFeatures(path, frames, au_dim=6):
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension='.jpg', audio_file='', audio_extractor='wav2vec2', preload=True, model_center=None):
     cam_infos = []
-    if audio_extractor != 'wav2vec2':
-        raise ValueError('EmoTaG expects --audio_extractor wav2vec2.')
+    from utils.audio_features import feature_file
+    feature_file(audio_extractor)
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
         fl_x = contents.get('fl_x')
         fl_y = contents.get('fl_y')
         frames = contents['frames']
         if audio_file == '':
-            aud_features = np.load(os.path.join(path, 'aud_w2v.npy'))
+            aud_features = np.load(os.path.join(path, feature_file(audio_extractor)))
         else:
             aud_features = np.load(audio_file)
         aud_features = torch.from_numpy(aud_features)
         aud_features = aud_features.float().permute(0, 2, 1)
         auds = aud_features
         au_features = loadAUFeatures(path, frames)
-        # DeepFace emotion teacher.
         emotion_features = None
         emotion_path = os.path.join(path, 'emotion_features.npy')
         if os.path.exists(emotion_path):
@@ -149,8 +146,6 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             cam_name = os.path.join(path, 'gt_imgs', str(img_id) + extension)
             c2w = np.array(frame['transform_matrix'])
             c2w[:3, 1:3] *= -1
-            # Use the VHAP-exported camera as-is (do not rescale translation or shift
-            # by model_center); this keeps the tracked mesh projecting onto GT pixels.
             w2c = np.linalg.inv(c2w)
             R = np.transpose(w2c[:3, :3])
             T = w2c[:3, 3]
@@ -186,9 +181,6 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                     mouth_interior_mask = (mask[:, :, 0] == 100) & (mask[:, :, 1] == 100) & (mask[:, :, 2] == 100)
                     neck_mask = (mask[:, :, 0] == 0) & (mask[:, :, 1] == 255) & (mask[:, :, 2] == 0)
                     complete_head_mask = hair_mask | skin_mask | mouth_interior_mask | neck_mask
-                    # Bit-packed to cut preload RAM (byte-per-pixel bool masks are a
-                    # large share of the multi-scene CPU footprint); consumers unpack
-                    # via utils.mask_utils.unpack_bool_mask.
                     talking_dict['face_mask'] = pack_bool_mask(complete_head_mask)
                     talking_dict['hair_mask'] = pack_bool_mask(hair_mask)
                 else:
@@ -205,6 +197,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             talking_dict['frame_id'] = img_id
             au_idx = min(int(img_id), au_features.shape[0] - 1)
             talking_dict['au_features'] = torch.from_numpy(au_features[au_idx]).float()
+            _win = np.clip(np.arange(au_idx - 4, au_idx + 4), 0, au_features.shape[0] - 1)
+            talking_dict['au_window'] = torch.from_numpy(au_features[_win]).float()
             if emotion_features is not None:
                 emo_idx = min(int(img_id), emotion_features.shape[0] - 1)
                 p_emo = emotion_features[emo_idx]
@@ -236,8 +230,6 @@ def readNerfSyntheticInfo(path, white_background, eval, extension='.jpg', args=N
     if not eval:
         print('Reading Training Transforms')
         train_cam_infos = readCamerasFromTransforms(path, 'transforms.json', white_background, extension, args.audio_file, args.audio_extractor, preload=preload, model_center=model_center)
-        # Pretraining only consumes train cameras, so skip preloading a second copy
-        # of every frame as evaluation cameras (halves CPU RAM for data never used).
         test_cam_infos = []
     else:
         print('Reading Evaluation Transforms')

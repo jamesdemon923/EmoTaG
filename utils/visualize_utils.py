@@ -1,6 +1,7 @@
 """Lightweight training logging helpers for EmoTaG."""
 
 import json
+import atexit
 import os
 
 import matplotlib.pyplot as plt
@@ -17,6 +18,9 @@ class LossTracker:
         self.warm_up_iter = warm_up_iter
         self.scene_paths = scene_paths
         self.scene_losses = {scene_name: [] for scene_name in data_list}
+        self._pending_detailed, self._pending_scene = [], {}
+        self.flush_interval = int(os.environ.get("EMOTAG_LOG_FLUSH", "500"))
+        atexit.register(self.flush)
         self.detailed_loss_path = os.path.join(output_dir, "training_loss.txt")
         self.scene_loss_files = {}
         os.makedirs(output_dir, exist_ok=True)
@@ -41,10 +45,21 @@ class LossTracker:
         phase = "warmup" if is_warmup else "dynamic"
         value = float(loss_value)
         self.scene_losses.setdefault(scene_name, []).append((iteration, value, is_warmup, frame_id))
-        with open(self.detailed_loss_path, "a", encoding="utf-8") as file:
-            file.write(f"{scene_name} | {iteration} | {frame_id} | {value:.6f} | {phase}\n")
-        with open(self.scene_loss_files[scene_name], "a", encoding="utf-8") as file:
-            file.write(f"{iteration} | {frame_id} | {value:.6f} | {phase}\n")
+        self._pending_detailed.append(f"{scene_name} | {iteration} | {frame_id} | {value:.6f} | {phase}\n")
+        self._pending_scene.setdefault(scene_name, []).append(f"{iteration} | {frame_id} | {value:.6f} | {phase}\n")
+        if len(self._pending_detailed) >= self.flush_interval:
+            self.flush()
+
+    def flush(self):
+        if self._pending_detailed and self.detailed_loss_path not in self.scene_loss_files.values():
+            with open(self.detailed_loss_path, "a", encoding="utf-8") as file:
+                file.writelines(self._pending_detailed)
+        for scene_name, lines in self._pending_scene.items():
+            if lines:
+                with open(self.scene_loss_files[scene_name], "a", encoding="utf-8") as file:
+                    file.writelines(lines)
+        self._pending_detailed = []
+        self._pending_scene = {}
 
     def get_scene_loss_history(self, scene_name):
         return [loss for _, loss, _, _ in self.scene_losses.get(scene_name, [])]
@@ -62,6 +77,7 @@ class ImageDebugger:
         self.warm_up_iter = warm_up_iter
         self.scene_paths = scene_paths
         self.last_renders = {}
+        self.plot_interval = int(os.environ.get("EMOTAG_PLOT_INTERVAL", "1000"))
         self.loss_tracker = LossTracker(output_dir, data_list, warm_up_iter, scene_paths)
 
     def save_images_and_update_loss(self, iteration, current_scene_name, rendered_image, gt_image, loss_value, scene_model_path, frame_id, save_images=False):
@@ -74,7 +90,8 @@ class ImageDebugger:
             save_image(gt_image_t, os.path.join(image_save_path, f"gt_{iteration}_{frame_id}.png"))
         self.loss_tracker.record_loss(iteration, current_scene_name, frame_id, loss_value)
         self.last_renders[current_scene_name] = {"render": image_t, "gt": gt_image_t, "scene_model_path": scene_model_path}
-        self._update_loss_plot()
+        if iteration % self.plot_interval == 0:
+            self._update_loss_plot()
 
     def _update_loss_plot(self):
         histories = self.loss_tracker.get_all_scene_loss_histories()
@@ -93,6 +110,7 @@ class ImageDebugger:
             plt.close()
 
     def save_final_images(self):
+        self._update_loss_plot()
         for scene_name, data in self.last_renders.items():
             image_save_path = os.path.join(data["scene_model_path"], "images")
             os.makedirs(image_save_path, exist_ok=True)

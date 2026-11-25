@@ -22,4 +22,7 @@ python adapt_emotag.py \
   --iterations "$iterations" \
   --warm_up_iter "$warmup" \
   --sh_degree 1 \
-  --N_views "$n_views"
+  --N_views "$n_views" \
+  --adapt_adain_only \
+  --adapt_unfreeze_heads \
+  "${@:6}"

@@ -159,7 +159,46 @@ class LPIPSMeter:
         return f"LPIPS ({self.net}): {self.measure():.6f}"
 
 
-def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: str, backend: str = "fan") -> dict[str, float]:
+def load_masks(path: str | None):
+    """Per-frame head-region masks written by tools/render_composited.py."""
+    if not path:
+        return None
+    data = np.load(path)
+    shape = tuple(int(x) for x in data["shape"])
+    return np.unpackbits(data["masks"], axis=-1, count=shape[-1]).astype(bool).reshape(shape)
+
+
+class RegionMeter:
+    """PSNR inside the head mask, SSIM / LPIPS on the mask's bounding box."""
+
+    def __init__(self, lpips_fn, device):
+        from utils.loss_utils import ssim as ssim_fn
+        self.lpips_fn, self.ssim_fn, self.device = lpips_fn, ssim_fn, device
+        self.psnr, self.ssim, self.lpips, self.count = 0.0, 0.0, 0.0, 0
+
+    def update(self, pred: torch.Tensor, truth: torch.Tensor, mask: np.ndarray) -> None:
+        if mask is None or not mask.any():
+            return
+        m = torch.from_numpy(mask).to(pred.device)
+        diff = ((pred[0] - truth[0]) ** 2)[m]
+        self.psnr += float(-10 * torch.log10(diff.mean().clamp_min(1e-10)))
+        ys, xs = np.where(mask)
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        pc = pred[:, y0:y1, x0:x1].permute(0, 3, 1, 2).contiguous()
+        tc = truth[:, y0:y1, x0:x1].permute(0, 3, 1, 2).contiguous()
+        self.ssim += float(self.ssim_fn(pc, tc))
+        self.lpips += float(self.lpips_fn(tc, pc, normalize=True))
+        self.count += 1
+
+    def measure(self) -> dict[str, float]:
+        if self.count == 0:
+            return {}
+        return {"PSNR_head": self.psnr / self.count, "SSIM_head": self.ssim / self.count,
+                "LPIPS_head": self.lpips / self.count}
+
+
+def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: str, backend: str = "fan",
+                    masks_path: str | None = None, skip_lmd: bool = False) -> dict[str, float]:
     if not os.path.exists(rendered_video_path):
         raise FileNotFoundError(f"Rendered video not found: {rendered_video_path}")
     if not os.path.exists(gt_video_path):
@@ -167,10 +206,12 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
 
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lmd_meter = LMDMeter(backend=backend)
+    lmd_meter = None if skip_lmd else LMDMeter(backend=backend)
     psnr_meter = PSNRMeter()
     ssim_meter = SSIMMeter(device=device)
     lpips_meter = LPIPSMeter(device=device)
+    masks = load_masks(masks_path)
+    region_meter = RegionMeter(lpips_meter.fn, device) if masks is not None else None
 
     rendered_capture = cv2.VideoCapture(rendered_video_path)
     gt_capture = cv2.VideoCapture(gt_video_path)
@@ -183,6 +224,9 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
     gt_frames = int(gt_capture.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Rendered frames: {rendered_frames}")
     print(f"Ground-truth frames: {gt_frames}")
+    if masks is not None and len(masks) != min(rendered_frames, gt_frames):
+        print(f"Warning: {len(masks)} head masks for {min(rendered_frames, gt_frames)} frames; the masks must come from "
+              f"the same render (same --eval_from/--eval_to). Head metrics cover only the overlap.")
     if rendered_frames != gt_frames:
         print(f"Warning: frame count mismatch; evaluating {min(rendered_frames, gt_frames)} aligned frames.")
 
@@ -200,11 +244,16 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
             psnr_meter.update(rendered, gt)
             ssim_meter.update(rendered, gt)
             lpips_meter.update(rendered, gt)
-            try:
-                lmd_meter.update(rendered, gt)
-            except Exception as exc:
-                failed_lmd_frames += 1
-                print(f"LMD unavailable for frame {processed}: {exc}")
+            if region_meter is not None and processed < len(masks):
+                if masks[processed].shape != tuple(frame_rendered.shape[:2]):
+                    raise ValueError(f"mask size {masks[processed].shape} != frame size {frame_rendered.shape[:2]}")
+                region_meter.update(rendered, gt, masks[processed])
+            if lmd_meter is not None:
+                try:
+                    lmd_meter.update(rendered, gt)
+                except Exception as exc:
+                    failed_lmd_frames += 1
+                    print(f"LMD unavailable for frame {processed}: {exc}")
         except Exception as exc:
             failed_frames += 1
             print(f"Failed to evaluate frame {processed}: {exc}")
@@ -218,7 +267,7 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
         raise RuntimeError("No frames were processed.")
 
     results = {
-        "LMD": lmd_meter.measure(),
+        "LMD": lmd_meter.measure() if lmd_meter is not None else float("nan"),
         "PSNR": psnr_meter.measure(),
         "SSIM": ssim_meter.measure(),
         "LPIPS": lpips_meter.measure(),
@@ -227,7 +276,10 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
         "failed_lmd_frames": float(failed_lmd_frames),
     }
 
-    print(lmd_meter.report())
+    if region_meter is not None:
+        results.update(region_meter.measure())
+    if lmd_meter is not None:
+        print(lmd_meter.report())
     print(psnr_meter.report())
     print(ssim_meter.report())
     print(lpips_meter.report())
@@ -245,6 +297,13 @@ def evaluate_videos(rendered_video_path: str, gt_video_path: str, output_dir: st
         file.write(f"PSNR: {results['PSNR']:.6f}\n")
         file.write(f"SSIM: {results['SSIM']:.6f}\n")
         file.write(f"LPIPS: {results['LPIPS']:.6f}\n")
+        for key in ("PSNR_head", "SSIM_head", "LPIPS_head"):
+            if key in results:
+                file.write(f"{key}: {results[key]:.6f}\n")
+                print(f"{key}: {results[key]:.6f}")
+    import json
+    with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as file:
+        json.dump(results, file, indent=2)
     print(f"Metrics saved to: {metrics_path}")
     return results
 
@@ -306,6 +365,17 @@ def build_parser() -> argparse.ArgumentParser:
     video_parser.add_argument("output_dir", help="Directory to save metrics.txt.")
     video_parser.add_argument("--backend", choices=["fan", "dlib"], default="fan", help="Landmark backend for LMD.")
 
+    video_parser.add_argument("--masks", default=None, help="masks_<name>.npz from render_composited.py: adds head-region PSNR/SSIM/LPIPS.")
+    video_parser.add_argument("--skip_lmd", action="store_true", help="Skip the (slow) FAN landmark distance.")
+
+    sync_parser = subparsers.add_parser("sync", help="Sync-C / Sync-E (LSE-C / LSE-D) with SyncNet.")
+    sync_parser.add_argument("video", help="Rendered video (frames).")
+    sync_parser.add_argument("audio", help="Driving audio (wav, or a video with an audio track).")
+    sync_parser.add_argument("--syncnet_root", default=None, help="joonson/syncnet_python checkout with weights (or $SYNCNET_ROOT).")
+    sync_parser.add_argument("--output", default=None, help="Optional JSON output path.")
+    sync_parser.add_argument("--audio_start_frame", type=int, default=0,
+                             help="Frame of the audio that matches the first video frame (e.g. 125 with --eval_from 125 and the full aud.wav).")
+
     au_parser = subparsers.add_parser("au", help="Evaluate AU metrics from OpenFace CSV files.")
     au_parser.add_argument("rendered_csv", type=Path, help="OpenFace CSV for rendered frames.")
     au_parser.add_argument("gt_csv", type=Path, help="OpenFace CSV for ground-truth frames.")
@@ -318,7 +388,15 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.metric == "video":
-            evaluate_videos(args.rendered_video, args.gt_video, args.output_dir, args.backend)
+            evaluate_videos(args.rendered_video, args.gt_video, args.output_dir, args.backend, args.masks, args.skip_lmd)
+        elif args.metric == "sync":
+            import json
+            from utils.syncnet_lse import SyncNetScorer
+            res = SyncNetScorer(args.syncnet_root).score(args.video, args.audio, audio_start_frame=args.audio_start_frame)
+            print(json.dumps(res, indent=2))
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as file:
+                    json.dump(res, file, indent=2)
         elif args.metric == "au":
             evaluate_au(args.rendered_csv, args.gt_csv, args.output_dir)
     except Exception as exc:

@@ -14,11 +14,18 @@ optimization:
   warm_up_iter: 1000           # static appearance only during warmup
   lambda_dssim: 0.2
   gaussian_lr: 0.005
-  motion_net_lr: 0.0005        # adapt lr_net (higher than pretrain; only AdaIN trains)
+  motion_net_lr: 0.0005        # adapt lr_net (higher than pretrain; AdaIN + novel identity code train, plus the FLAME/mouth heads with --adapt_unfreeze_heads)
   adapt_adain_only: true       # freeze everything except AdaIN (freeze_for_adaptation)
   # Sapiens geometry priors ON for adaptation (needs sapiens/{depth,normal}):
   w_geo_depth: 0.01            # λ_D
   w_geo_normal: 0.001          # λ_N
+
+  # Defaults of adapt_emotag.py (see README, "Few-shot adaptation"):
+  au_mode: decoupled           # jaw/lower face from audio only; AUs -> upper face (--au_mode legacy)
+  window_supervision: true     # supervise all 8 frames of the audio window (--no_window_supervision)
+  w_vel: 1.0                   # FLAME velocity term
+  audio_lag_calibration: true  # measured on the adaptation clip (--no_audio_lag_calibration)
+  random_background: true      # random colour per step (--fixed_background for the green screen)
 
 misc:
   seed: 0
@@ -28,6 +35,6 @@ misc:
 #   CUDA_VISIBLE_DEVICES=0 python adapt_emotag.py \
 #     -s data/<ID> -m output/adapt/<ID> --audio_extractor wav2vec2 \
 #     --pretrain_path output/pretrain/chkpnt_ema_face_latest.pth \
-#     --iterations 20000 --warm_up_iter 1000 --adapt_adain_only \
+#     --iterations 20000 --warm_up_iter 1000 --adapt_adain_only --adapt_unfreeze_heads \
 #     --sh_degree 1 --N_views 125
 # Output: output/adapt/<ID>/chkpnt_face_latest.pth

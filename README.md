@@ -55,6 +55,7 @@ pip install ./diff-gaussian-rasterization
 | [FLAME](https://flame.is.tue.mpg.de/index.html) | FLAME parametric head model |
 | [VHAP](https://github.com/ShenhanQian/VHAP) | FLAME tracking environment |
 | [Wav2Vec2](https://huggingface.co/facebook/wav2vec2-base-960h) | Audio feature extraction backbone |
+| [Whisper](https://huggingface.co/openai/whisper-small) | Multilingual audio feature extraction |
 | [py-feat](https://py-feat.org/) | Action Unit (AU) feature extraction |
 | [DeepFace](https://github.com/serengil/deepface) | Per-frame emotion features |
 | [CVLface](https://github.com/mk-minchul/CVLface) | Identity embedding |
@@ -107,6 +108,22 @@ bash tools/run_sapiens_priors.sh data/neutral_Obama
 
 `source_videos/` in the same folder holds the cropped 512×512 source clips for
 anyone who prefers to re-run the full preprocessing pipeline.
+
+**Scene patch (please update).** `scene_patch_v2.tar.gz` in the same folder fixes the
+audio/video offset of the released scenes and re-fits the tracked lips and eyelids
+(Step 4b). Extract it over `data/`:
+
+```bash
+tar xzf scene_patch_v2.tar.gz -C data/
+```
+
+The folder also holds the emotion-intensity test scenes (`test_data/emotional/intensity/`,
+Level-1/2/3 clips of `mead1_angry`, `mead2_happy`, `mead2_surprised`) and the adapted
+checkpoints of every scene (`adapted_checkpoints/<scene>.tar.gz`, extract into `output/`).
+
+Frames used per set: `neutral_<ID>` adapt on `[0, 125)`, evaluate on `[125, 375)`;
+`mead1_<e>` adapt on `[0, 125)`, evaluate on the separate recording `mead1_<e>_test`;
+`mead2_<e>` adapt on `[0, 125)`, evaluate from frame 150.
 
 ---
 
@@ -177,13 +194,21 @@ python tools/extract_landmarks.py --scene data/<ID>
 # -> data/<ID>/ori_imgs/<id>.lms   shape [68, 2]
 ```
 
-### Step 3 — Audio features (Wav2Vec2)
+### Step 3 — Audio features (Whisper / Wav2Vec2)
 
 ```bash
+python tools/extract_whisper_features.py \
+  --wav        data/<ID>/aud.wav \
+  --output     data/<ID>/aud_whisper.npy \
+  --transforms data/<ID>/transforms.json
 python tools/extract_wav2vec2_features.py \
   --wav        data/<ID>/aud.wav \
   --output     data/<ID>/aud_w2v.npy \
   --transforms data/<ID>/transforms.json
+
+# check / fix the audio-video offset (needs SYNCNET_ROOT=/path/to/syncnet_python)
+python tools/check_av_sync.py data/<ID>
+python tools/check_av_sync.py data/<ID> --fix
 ```
 
 ### Step 4 — AU features (py-feat)
@@ -200,6 +225,16 @@ python tools/extract_pyfeat_au.py --scene data/<ID>
 > An OpenFace-based alternative wrapper (`tools/extract_openface_au.sh`, needs a
 > local OpenFace build via `OPENFACE_BIN`) is also provided; the released
 > checkpoint was trained with the py-feat features above.
+
+### Step 4b — Lip and eyelid re-fit
+
+Re-fits the tracked FLAME expression and jaw to the lip landmarks and the blink AU
+(needs Steps 1, 2 and 4). Run it on adaptation and driving clips alike:
+
+```bash
+python tools/refine_landmarks.py data/<ID>
+# -> data/<ID>/flame_params.npz (the tracked values are kept as flame_params_tracked.npz)
+```
 
 ### Step 5 — Emotion teacher (DeepFace)
 
@@ -283,13 +318,15 @@ python pretrain_emotag.py \
 python adapt_emotag.py \
   -s data/<ID> \
   -m output/<ID> \
-  --audio_extractor wav2vec2 \
-  --pretrain_path output/pretrain/chkpnt_ema_face_latest.pth \
+  --audio_extractor whisper \
+  --pretrain_path /path/to/chkpnt_ema_face_latest.pth \
   --iterations 20000 \
   --warm_up_iter 1000 \
   --N_views 125 \
   --adapt_adain_only \
-  --adapt_unfreeze_heads
+  --adapt_unfreeze_heads \
+  --intraoral rigid --intraoral_contain --intraoral_budget 6000 \
+  --motion_steps 1000
 ```
 
 > `--adapt_adain_only` freezes the pretrained GRMN and tunes only the AdaIN
@@ -297,6 +334,10 @@ python adapt_emotag.py \
 > FLAME/mouth prediction heads. Full hyper-parameters are in
 > [`configs/adapt_5s.yaml`](configs/adapt_5s.yaml). `--pretrain_path` takes the
 > multi-identity EMA checkpoint from the pre-training root.
+> `--intraoral rigid` binds the mouth interior to a teeth geometry and
+> `--motion_steps` fits the audio-to-motion heads for a short schedule only.
+> Several clips of one person: process each clip on its own and add
+> `--extra_scenes data/<ID>_clip2 ...` (do not concatenate videos).
 
 ### Pretrained checkpoint
 
@@ -304,12 +345,14 @@ To skip pre-training, download the multi-identity motion prior and adapt directl
 
 ### 📦 [**Download checkpoint (Google Drive)**](https://drive.google.com/drive/folders/17wgFUGF7pxbW3QlBkiHQzo3nYTzF-fiN?usp=drive_link)
 
+`chkpnt_ema_face_latest.pth` has been updated (it now takes Whisper features,
+`--audio_extractor whisper`): please download it again.
+
+To skip the adaptation as well, use the adapted checkpoints of the evaluation scenes from
+the test-data folder:
+
 ```bash
-python adapt_emotag.py -s data/<ID> -m output/<ID> \
-  --audio_extractor wav2vec2 \
-  --pretrain_path /path/to/chkpnt_ema_face_latest.pth \
-  --iterations 20000 --warm_up_iter 1000 --N_views 125 \
-  --adapt_adain_only --adapt_unfreeze_heads
+tar xzf adapted_checkpoints/<scene>.tar.gz -C output/     # -> output/<scene>/
 ```
 
 Pre-trained on quality-filtered HDTF identities
@@ -320,19 +363,28 @@ in [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
 
 ## Inference
 
-Render the composited video (the synthesized head over the per-frame
-torso+background, the standard talking-head protocol):
+Render the composited video (the synthesized head over the background, torso from
+the source frames, the standard talking-head protocol):
 
 ```bash
-python tools/render_composited.py \
-  -s data/<ID> \
-  -m output/<ID> \
-  --audio_extractor wav2vec2
+python tools/render_composited.py -s data/<ID> -m output/<ID>
 ```
 
-This writes `output/<ID>/test/rendered_comp.mp4` and the matching
-`gt_comp.mp4`. Add `--bg_mode gt` to keep the source video's real background
-(when the scene has `bg_imgs/`, i.e. the original pre-matting frames).
+This writes `output/<ID>/test/rendered_comp.mp4`, the matching `gt_comp.mp4` and
+versions with audio.
+
+```bash
+# novel audio: pose and AUs from the clip, audio from new.wav
+python tools/extract_whisper_features.py --wav new.wav --output new_whisper.npy
+python tools/render_composited.py -s data/<ID> -m output/<ID> \
+  --audio_file new_whisper.npy --wav new.wav --N_views -1
+
+# another clip of the same person (other emotion / recording)
+python tools/render_composited.py -s data/<driving clip> -m output/<ID>
+```
+
+An avatar reproduces what its 5-s adaptation clip shows; expressions that never occur
+in it (another emotion, a blink, a very wide mouth) are kept within the adapted range.
 
 ---
 
@@ -342,14 +394,27 @@ Render the held-out segment (frames after the 5s/125-frame adaptation clip)
 and compute the video metrics on it:
 
 ```bash
-python tools/render_composited.py \
-  -s data/<ID> -m output/<ID> \
-  --audio_extractor wav2vec2 --eval_from 125
+python tools/render_composited.py -s data/<ID> -m output/<ID> --eval_from 125
 
 python evaluate_metrics.py video \
   output/<ID>/test/rendered_comp.mp4 \
   output/<ID>/test/gt_comp.mp4 \
-  output/<ID>/test
+  output/<ID>/test --masks output/<ID>/test/masks_comp.npz
+
+# lip sync (SyncNet, needs SYNCNET_ROOT)
+python evaluate_metrics.py sync output/<ID>/test/rendered_comp.mp4 data/<ID>/aud.wav \
+  --audio_start_frame 125
+```
+
+The whole benchmark on the released scenes (held-out reconstruction, cross-recording,
+novel audio of another speaker / language, emotion intensity):
+
+```bash
+python tools/run_benchmark.py all --data data --output output       # models in output/<scene>
+python tools/run_benchmark.py eval --data data --model output/<scene> --scene <scene> --novel_audio xid
+python tools/run_benchmark.py eval --data data --model output/mead2_happy --scene mead2_happy \
+  --test_scene mead2_happy_lvl1 --tag intensity_lvl1
+python tools/run_benchmark.py summary --output output
 ```
 
 ### Action-Unit metrics (optional)

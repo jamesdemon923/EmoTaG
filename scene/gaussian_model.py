@@ -54,14 +54,14 @@ class GaussianModel:
         self.setup_functions()
         self.mouth_mask = None
         self.mouth_indices = None
-        # When True, the intra-oral gaussian subset is kept near its small
-        # anatomically-initialized size during densify/prune. Left unconstrained, the
-        # audio-driven mouth gaussians attract densification and can grow to dominate
-        # the head, degrading generalization to unseen frames.
         self.freeze_mouth_set = False
-        # Max allowed size of the intra-oral set when freeze_mouth_set is on
-        # (None = hard freeze at the current count).
         self.mouth_budget = None
+        self.intraoral_mode = 'audio'
+        self.intraoral_min_opacity = 0.05
+
+    @property
+    def intraoral_rigid(self):
+        return self.intraoral_mode == 'rigid'
 
     def _mouth_growth_blocked(self):
         if not self.freeze_mouth_set or self.mouth_mask is None:
@@ -71,11 +71,7 @@ class GaussianModel:
         return int(self.mouth_mask.sum().item()) >= int(self.mouth_budget)
 
     def set_mouth_mask(self, mask: torch.Tensor, indices: torch.Tensor=None):
-        """
-        Set the mouth subset for this GaussianModel.
-        - mask: Bool tensor [N], True indicates a mouth Gaussian
-        - indices: Optional Long tensor of indices, for logging/debug
-        """
+        """Set the mouth subset for this GaussianModel."""
         if mask is None:
             self.mouth_mask = None
             self.mouth_indices = None
@@ -106,24 +102,29 @@ class GaussianModel:
         return torch.nonzero(self.mouth_mask, as_tuple=False).flatten().long().to(self._xyz.device)
 
     def capture(self):
-        # Densification grows the FLAME binding (face_indices/bary_coords) in lockstep
-        # with _xyz. Persist it so restore() can rebuild a binding that matches the
-        # (possibly densified) gaussian count; otherwise get_canonical_xyz mismatches
-        # the freshly re-initialised 60k binding. Appended last for backward compat.
         binding_state = None
         if self.flame_binding is not None:
             binding_state = (self.flame_binding.face_indices.detach().cpu(),
                              self.flame_binding.bary_coords.detach().cpu())
-        # Densification permutes and grows the gaussian set, so the on-disk
-        # mouth_point_indices.npy does not identify the mouth gaussians after training.
-        # Persist the live mask so downstream rendering drives the mouth branch on the
-        # correct gaussians.
         mouth_state = self.mouth_mask.detach().cpu() if self.mouth_mask is not None else None
-        return (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest, self._scaling, self._rotation, self._opacity, self.max_radii2D, self.xyz_gradient_accum, self.denom, self.optimizer.state_dict(), self.spatial_lr_scale, self.neural_renderer.state_dict(), self.neural_motion_grid.state_dict() if self.neural_motion_grid is not None else None, binding_state, mouth_state)
+        identity_state = None
+        if self.flame_binding is not None:
+            identity_state = {'canonical_vertices': self.flame_binding.canonical_mesh_vertices.detach().cpu()}
+            shape = getattr(self, 'identity_flame_shape', None)
+            if shape is None and getattr(self, 'flame_wrapper', None) is not None and self.flame_wrapper.all_flame_params:
+                first = self.flame_wrapper.all_flame_params[min(self.flame_wrapper.all_flame_params)]
+                shape = torch.as_tensor(first['shape']).float().reshape(1, -1)
+            identity_state['flame_shape'] = shape.detach().cpu() if shape is not None else None
+            identity_state['intraoral_mode'] = self.intraoral_mode
+        return (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest, self._scaling, self._rotation, self._opacity, self.max_radii2D, self.xyz_gradient_accum, self.denom, self.optimizer.state_dict(), self.spatial_lr_scale, self.neural_renderer.state_dict(), self.neural_motion_grid.state_dict() if self.neural_motion_grid is not None else None, binding_state, mouth_state, identity_state)
+
+    @staticmethod
+    def checkpoint_intraoral_mode(model_args):
+        """'audio' or 'rigid'."""
+        identity_state = model_args[16] if len(model_args) > 16 else None
+        return (identity_state or {}).get('intraoral_mode', 'audio')
 
     def restore(self, model_args, training_args):
-        # Old checkpoints have 14 elements; new ones append binding_state. Unpack the
-        # fixed prefix and treat the binding as optional.
         (self.active_sh_degree, self._xyz, self._features_dc, self._features_rest, self._scaling,
          self._rotation, self._opacity, self.max_radii2D, xyz_gradient_accum, denom, opt_dict,
          self.spatial_lr_scale, neural_renderer_state, neural_motion_grid_state, *rest) = model_args
@@ -136,7 +137,6 @@ class GaussianModel:
             self.optimizer.load_state_dict(opt_dict)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        # Restore the densified FLAME binding so it matches the restored gaussian count.
         binding_state = rest[0] if len(rest) > 0 else None
         if binding_state is not None and self.flame_binding is not None:
             face_indices, bary_coords = binding_state
@@ -148,11 +148,36 @@ class GaussianModel:
             print(f"[restore] WARNING: gaussian count ({self._xyz.shape[0]}) != binding count "
                   f"({self.flame_binding.face_indices.shape[0]}); checkpoint predates the binding fix "
                   f"and cannot be rendered. Re-train to produce a compatible checkpoint.")
-        # Restore the (densification-tracked) mouth mask; older checkpoints lack it.
         mouth_state = rest[1] if len(rest) > 1 else None
         if mouth_state is not None:
             self.mouth_mask = mouth_state.bool().to(self._xyz.device)
             self.mouth_indices = self._recompute_mouth_indices_from_mask()
+        identity_state = rest[2] if len(rest) > 2 else None
+        self.restored_identity = identity_state
+        self.intraoral_mode = self.checkpoint_intraoral_mode(model_args)
+        if self.intraoral_rigid and getattr(self, 'flame_wrapper', None) is not None and not self.flame_wrapper.teeth:
+            raise RuntimeError('checkpoint with a rigid intra-oral set, but the FLAME mesh was built without teeth: '
+                               'build SimpleFlameWrapper with add_teeth=True')
+
+    def apply_identity(self, identity_state=None, with_shape=False):
+        """Re-bind to the adaptation identity's canonical mesh."""
+        identity_state = identity_state if identity_state is not None else getattr(self, 'restored_identity', None)
+        if not identity_state or self.flame_binding is None:
+            return False
+        b = self.flame_binding
+        can = identity_state.get('canonical_vertices')
+        if can is not None:
+            can = can.float().to(b.canonical_mesh_vertices.device)
+            if getattr(self, 'flame_wrapper', None) is not None:
+                can = self.flame_wrapper.pad_canonical(can)
+            b.canonical_mesh_vertices = can
+            b._canonical_frames = None
+            b._update_canonical_points()
+        shape = identity_state.get('flame_shape')
+        if with_shape and shape is not None and getattr(self, 'flame_wrapper', None) is not None:
+            self.flame_wrapper.override_shape(shape)
+            self.identity_flame_shape = shape
+        return True
 
     def get_deformed_gaussians(self, flame_verts, flame_pose=None):
         """Internal helper."""
@@ -168,12 +193,6 @@ class GaussianModel:
         _, _, scaling = self._canonical_frame_per_point()
         return self.scaling_activation(self._scaling) * scaling
 
-    # ------------------------------------------------------------------
-    # Triangle-local parameterization (paper Eq.7 / GaussianAvatars):
-    # _xyz/_rotation/_scaling are stored in the parent triangle's local frame;
-    # the world-space accessors below evaluate them on the CANONICAL mesh.
-    # get_deformed_gaussians evaluates the same mapping on a deformed mesh.
-    # ------------------------------------------------------------------
     def _canonical_frame_per_point(self):
         center, orien, scaling = self.flame_binding.canonical_face_frames()
         fi = self.flame_binding.face_indices
@@ -237,15 +256,7 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, binding_data: Dict=None):
-        """
-        Creates Gaussians from a PLY point cloud and, optionally, binding data.
-        
-        This method has two modes:
-        1. With binding_data: Initializes Gaussians with precise canonical positions
-           derived from a mesh, and sets up the FLAME binding for deformation.
-        2. Without binding_data: A fallback that initializes Gaussians directly
-           from the point cloud coordinates, without any FLAME binding.
-        """
+        """Creates Gaussians from a PLY point cloud and, optionally, binding data."""
         self.spatial_lr_scale = spatial_lr_scale
         if binding_data is not None:
             print('OK Binding data found. Initializing Gaussians with pre-computed binding.')
@@ -258,7 +269,7 @@ class GaussianModel:
         """Initializes Gaussians and their FLAME binding using pre-computed data."""
         face_indices = torch.tensor(binding_data['face_indices']).cuda()
         bary_coords = torch.tensor(binding_data['bary_coords']).float().cuda()
-        canonical_vertices = torch.tensor(binding_data['vertices']).float().cuda()
+        canonical_vertices = self.flame_wrapper.pad_canonical(torch.tensor(binding_data['vertices']).float().cuda())
         fused_color = RGB2SH(torch.tensor(pcd.colors, dtype=torch.float, device='cuda'))
         features = torch.zeros((len(pcd.points), 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0] = fused_color
@@ -276,9 +287,6 @@ class GaussianModel:
         self.max_radii2D = torch.zeros(self._xyz.shape[0], device='cuda')
         self.neural_renderer = GridRenderer(bound=(torch.tensor(pcd.points).max(0).values - torch.tensor(pcd.points).min(0).values).max() / 2 * 1.2, coord_center=torch.tensor(pcd.points).mean(0)).cuda()
         self._init_flame_binding(face_indices, bary_coords, canonical_vertices)
-        # Local mode: express the sampled surface points and their world-space initial
-        # scales in the triangle-local parameterization (so world accessors reproduce
-        # them). Hybrid mode keeps zero world offsets around the barycentric anchors.
         from scene.flame_gaussian_model import binding_mode
         if binding_mode() == 'local':
             with torch.no_grad():
@@ -286,6 +294,92 @@ class GaussianModel:
                 self._xyz.data = self.world_to_local_xyz(bary_points)
                 _, _, k_pt = self._canonical_frame_per_point()
                 self._scaling.data = self._scaling.data - torch.log(k_pt + 1e-12)
+
+    @torch.no_grad()
+    def add_intraoral_gaussians(self, n_teeth=2000, n_cavity=500, budget=4000, drop_mask=None, seed=0):
+        """Rigid intra-oral set."""
+        from scene.flame_gaussian_model import binding_mode
+        fw, b = self.flame_wrapper, self.flame_binding
+        groups = fw.teeth_face_groups()
+        if not groups:
+            raise RuntimeError('the FLAME mesh has no teeth geometry: build SimpleFlameWrapper with add_teeth=True')
+        dev = self._xyz.device
+        if drop_mask is not None and bool(drop_mask.any()):
+            keep = ~drop_mask.to(dev)
+            for name in ('_xyz', '_features_dc', '_features_rest', '_scaling', '_rotation', '_opacity'):
+                setattr(self, name, nn.Parameter(getattr(self, name).detach()[keep].requires_grad_(True)))
+            b.update_binding('prune', ~keep)
+        g = torch.Generator(device='cpu').manual_seed(seed)
+        verts, faces = b.canonical_mesh_vertices, b.faces.long()
+
+        def sample(fids, n):
+            tri = verts[faces[fids]]
+            area = 0.5 * torch.linalg.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], dim=-1).norm(dim=-1)
+            pick = torch.multinomial(area.cpu() / area.sum().cpu(), n, replacement=True, generator=g).to(dev)
+            u = torch.rand(n, 2, generator=g).to(dev)
+            su = u[:, 0].sqrt()
+            bary = torch.stack([1 - su, su * (1 - u[:, 1]), su * u[:, 1]], 1)
+            return fids[pick], bary, float(area.sum())
+
+        def frame(prefix):
+            """(back, down) unit vectors of one jaw half."""
+            c = lambda k: verts[faces[groups[prefix + k]]].reshape(-1, 3).mean(0)
+            back = torch.nn.functional.normalize(c('_back') - c('_front'), dim=0)
+            pts = verts[faces[groups[prefix + '_front']]].reshape(-1, 3)
+            edge_c = verts[faces[groups[prefix + '_edge']]].reshape(-1, 3).mean(0)
+            down = torch.nn.functional.normalize(edge_c - pts.mean(0), dim=0)
+            lvl = (pts - pts.mean(0)) @ down
+            return back, down, float(lvl.max() - lvl.min()) + 1e-6
+
+        parts = []
+        n_front = int(n_teeth * 0.4)
+        n_edge = (n_teeth - 2 * n_front) // 2
+        for prefix in ('upper', 'lower'):
+            for part, n in (('_front', n_front), ('_edge', n_edge)):
+                fi, bary, area = sample(groups[prefix + part], n)
+                sigma = 0.5 * (area / n) ** 0.5
+                parts.append((fi, bary, torch.zeros(n, 3, device=dev), sigma, (0.80, 0.78, 0.72), 0.5))
+        n_up = int(n_cavity * 0.6)
+        for prefix, n in (('upper', n_up), ('lower', n_cavity - n_up)):
+            back, down, h = frame(prefix)
+            fi, bary, _ = sample(groups[prefix + '_back'], n)
+            u = torch.rand(n, 2, generator=g).to(dev)
+            anchor = (verts[faces[fi]] * bary[:, :, None]).sum(1)
+            lvl = ((anchor - anchor.mean(0)) @ down)
+            want = (u[:, 0] * (2.5 if prefix == 'upper' else 1.0) - 0.5) * h
+            off = back[None] * (0.004 + 0.012 * u[:, 1:2]) + down[None] * (want - lvl)[:, None]
+            parts.append((fi, bary, off, 0.002, (0.25, 0.10, 0.10), 0.8))
+        fi = torch.cat([p_[0] for p_ in parts]); bary = torch.cat([p_[1] for p_ in parts])
+        off = torch.cat([p_[2] for p_ in parts])
+        sig = torch.cat([torch.full((len(p_[0]), 3), float(p_[3]), device=dev) for p_ in parts])
+        rgb = torch.cat([torch.tensor([p_[4]], device=dev).repeat(len(p_[0]), 1) for p_ in parts])
+        opa = torch.cat([torch.full((len(p_[0]), 1), float(p_[5]), device=dev) for p_ in parts])
+        n_old, n = self._xyz.shape[0], len(fi)
+        b.append(fi, bary)
+        if binding_mode() == 'local':
+            anchor = (verts[faces[fi]] * bary[:, :, None]).sum(1)
+            xyz = self.world_to_local_xyz(anchor + off, face_idx=fi)
+            scl = self.scale_world_to_local_log(sig, face_idx=fi)
+        else:
+            xyz, scl = off, self.scaling_inverse_activation(sig)
+        f_dc = RGB2SH(rgb)[:, None, :]
+        f_rest = torch.zeros((n, self._features_rest.shape[1], 3), device=dev)
+        rot = torch.zeros((n, 4), device=dev); rot[:, 0] = 1
+        cat = lambda a, x: nn.Parameter(torch.cat([a.detach(), x.to(a)], 0).requires_grad_(True))
+        self._xyz, self._scaling, self._rotation = cat(self._xyz, xyz), cat(self._scaling, scl), cat(self._rotation, rot)
+        self._features_dc, self._features_rest = cat(self._features_dc, f_dc), cat(self._features_rest, f_rest)
+        self._opacity = cat(self._opacity, inverse_sigmoid(opa))
+        self.max_radii2D = torch.zeros(self._xyz.shape[0], device=dev)
+        mask = torch.zeros(n_old + n, dtype=torch.bool, device=dev)
+        mask[n_old:] = True
+        self.mouth_mask = mask
+        self.mouth_indices = self._recompute_mouth_indices_from_mask()
+        self.intraoral_mode = 'rigid'
+        self.freeze_mouth_set = True
+        self.mouth_budget = int(budget)
+        print(f'[intraoral] rigid set: {n} gaussians on {int(sum(len(v) for v in groups.values()))} teeth faces '
+              f'({2 * n_front} front, {2 * n_edge} edge, {n_cavity} cavity backing); budget {budget}; total {n_old + n}')
+        return n
 
     def _init_flame_binding(self, face_indices, bary_coords, canonical_vertices):
         """Initializes the FLAME binding system with pre-computed binding info."""
@@ -310,7 +404,7 @@ class GaussianModel:
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale, lr_final=training_args.position_lr_final * self.spatial_lr_scale, lr_delay_mult=training_args.position_lr_delay_mult, max_steps=training_args.position_lr_max_steps)
 
     def update_learning_rate(self, iteration):
-        """ Learning rate scheduling per step """
+        """Learning rate scheduling per step."""
         for param_group in self.optimizer.param_groups:
             if param_group['name'] == 'xyz':
                 lr = self.xyz_scheduler_args(iteration)
@@ -377,6 +471,8 @@ class GaussianModel:
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01))
+        if self.intraoral_rigid and self.mouth_mask is not None:
+            opacities_new = torch.where(self.mouth_mask[:, None], self._opacity.detach(), opacities_new)
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, 'opacity')
         self._opacity = optimizable_tensors['opacity']
 
@@ -512,13 +608,10 @@ class GaussianModel:
         rots = build_rotation(self.get_rotation[selected_pts_mask]).repeat(N, 1, 1)
         sampled_world = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         if binding_mode() == 'hybrid':
-            # _xyz is a world offset around the (inherited) barycentric anchor.
             parent_anchor = self.flame_binding.get_canonical_points()[selected_pts_mask].repeat(N, 1)
             new_xyz = sampled_world - parent_anchor
             new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
         else:
-            # Children inherit the parent's triangle binding: express the sampled world
-            # position / shrunken world scale back in that triangle's local frame.
             parent_fi = self.flame_binding.face_indices[selected_pts_mask].repeat(N)
             new_xyz = self.world_to_local_xyz(sampled_world, face_idx=parent_fi)
             new_scaling = self.scale_world_to_local_log(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N), face_idx=parent_fi)
@@ -566,7 +659,12 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        if self.freeze_mouth_set and self.mouth_mask is not None:
+        if self.intraoral_rigid and self.mouth_mask is not None:
+            dead = (self.get_opacity < self.intraoral_min_opacity).squeeze()
+            if max_screen_size:
+                dead = torch.logical_or(dead, big_points_ws)
+            prune_mask = torch.where(self.mouth_mask, dead, prune_mask)
+        elif self.freeze_mouth_set and self.mouth_mask is not None:
             prune_mask = torch.logical_and(prune_mask, ~self.mouth_mask)
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()

@@ -16,6 +16,7 @@ from utils.audio_utils import get_audio_features
 from utils.au_utils import load_openface_au_csv
 from utils.emotion_utils import load_emotion_features, emotion_score_from_distribution
 from utils.mask_utils import pack_bool_mask
+from utils.drive_sanitize import load_drive_params, playback_order, raw_drive
 from scene.gaussian_model import BasicPointCloud
 
 class CameraInfo(NamedTuple):
@@ -68,9 +69,7 @@ def fetchPly(path):
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def fetchBindingData(path):
-    """
-    Load binding information from .npy files.
-    """
+    """Load binding information from .npy files."""
     try:
         face_indices = np.load(os.path.join(path, 'face_indices.npy'))
         bary_coords = np.load(os.path.join(path, 'bary_coords.npy'))
@@ -100,33 +99,35 @@ def loadAUFeatures(path, frames, au_dim=6):
         return au_features
     raise FileNotFoundError(f'Missing AU feature file: {au_path}')
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension='.jpg', audio_file='', audio_extractor='wav2vec2', N_views=-1, preload=True, model_center=None):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension='.jpg', audio_file='', audio_extractor='wav2vec2', N_views=-1, preload=True, model_center=None, audio_lag=0):
     cam_infos = []
-    if audio_extractor != 'wav2vec2':
-        raise ValueError('EmoTaG expects --audio_extractor wav2vec2.')
+    from utils.audio_features import feature_file
+    feature_file(audio_extractor)
     N_views = N_views if audio_file == '' else -1
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
         fl_x = contents.get('fl_x')
         fl_y = contents.get('fl_y')
-        frames = contents['frames'][:N_views]
+        frames = contents['frames'] if N_views is None or N_views <= 0 else contents['frames'][:N_views]
         if audio_file == '':
-            aud_features = np.load(os.path.join(path, 'aud_w2v.npy'))
+            aud_features = np.load(os.path.join(path, feature_file(audio_extractor)))
         else:
             aud_features = np.load(audio_file)
         aud_features = torch.from_numpy(aud_features)
         aud_features = aud_features.float().permute(0, 2, 1)
         auds = aud_features
         au_features = loadAUFeatures(path, frames)
-        # DeepFace emotion teacher.
         emotion_features = None
         emotion_path = os.path.join(path, 'emotion_features.npy')
         if os.path.exists(emotion_path):
             max_frame_id = max((int(frame.get('timestep_index', idx)) for idx, frame in enumerate(frames)))
             emotion_features = load_emotion_features(emotion_path, required_len=max_frame_id + 1)
-        if audio_file != '':
-            loop_time = auds.shape[0] // len(frames) + 1
-            frames *= loop_time
+        looped = audio_file != '' and auds.shape[0] > len(frames)
+        if looped:
+            flame_file = os.path.join(path, 'flame_params.npz')
+            glitched = set(load_drive_params(flame_file)[1]) if os.path.exists(flame_file) else set()
+            loop = [f for f in frames if int(f['timestep_index']) not in glitched]
+            frames = [loop[i] for i in playback_order(len(loop), auds.shape[0])]
         ldmks_lips = []
         ldmks_mouth = []
         ldmks_lhalf = []
@@ -153,10 +154,6 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             cam_name = os.path.join(path, 'gt_imgs', str(img_id) + extension)
             c2w = np.array(frame['transform_matrix'])
             c2w[:3, 1:3] *= -1
-            # Use the VHAP-exported camera as-is: the exported (camera, focal) pair is
-            # what projects the tracked FLAME mesh onto the GT pixels. Do not rescale
-            # the translation or shift by model_center here, which would break that
-            # projective consistency.
             w2c = np.linalg.inv(c2w)
             R = np.transpose(w2c[:3, :3])
             T = w2c[:3, 3]
@@ -192,25 +189,31 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                     mouth_interior_mask = (mask[:, :, 0] == 100) & (mask[:, :, 1] == 100) & (mask[:, :, 2] == 100)
                     neck_mask = (mask[:, :, 0] == 0) & (mask[:, :, 1] == 255) & (mask[:, :, 2] == 0)
                     complete_head_mask = hair_mask | skin_mask | mouth_interior_mask | neck_mask
-                    # Bit-packed to cut preload RAM (byte-per-pixel bool masks are a
-                    # large share of the multi-scene CPU footprint); consumers unpack
-                    # via utils.mask_utils.unpack_bool_mask.
                     talking_dict['face_mask'] = pack_bool_mask(complete_head_mask)
                     talking_dict['hair_mask'] = pack_bool_mask(hair_mask)
                 else:
                     raise FileNotFoundError(f'Parsing mask not found: {mask_path}')
             if audio_file == '':
-                talking_dict['auds'] = get_audio_features(auds, 2, img_id)
+                talking_dict['auds'] = get_audio_features(auds, 2, int(img_id) - int(audio_lag))
                 if img_id > auds.shape[0]:
                     print('[warnining] audio feature is too short')
                     break
             else:
-                talking_dict['auds'] = get_audio_features(auds, 2, idx)
+                talking_dict['auds'] = get_audio_features(auds, 2, idx - int(audio_lag))
                 if idx >= auds.shape[0]:
                     break
             talking_dict['frame_id'] = img_id
             au_idx = min(int(img_id), au_features.shape[0] - 1)
             talking_dict['au_features'] = torch.from_numpy(au_features[au_idx]).float()
+            src_idx = int(img_id) if audio_file == '' else idx
+            win = np.clip(np.arange(src_idx - 4, src_idx + 4), 0, au_features.shape[0] - 1)
+            if audio_file != '':
+                win = np.clip(np.arange(au_idx - 4, au_idx + 4), 0, au_features.shape[0] - 1)
+                if looped and not raw_drive():
+                    play = np.clip(np.arange(idx - 4, idx + 4), 0, len(frames) - 1)
+                    win = np.clip([int(frames[j]['timestep_index']) for j in play], 0, au_features.shape[0] - 1)
+            talking_dict['au_window'] = torch.from_numpy(au_features[win]).float()
+            talking_dict['window_frame_ids'] = [int(x) for x in np.arange(src_idx - 4, src_idx + 4)]
             if emotion_features is not None:
                 emo_idx = min(int(img_id), emotion_features.shape[0] - 1)
                 p_emo = emotion_features[emo_idx]
@@ -228,8 +231,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             talking_dict['lhalf_rect'] = ldmks_lhalf[idx]
             talking_dict['mouth_bound'] = [mouth_lb, mouth_ub, ldmks_mouth[idx, 1] - ldmks_mouth[idx, 0]]
             talking_dict['img_id'] = img_id
-            if N_views > 0:  # few-shot train load: attach Sapiens depth/normal priors. (Was gated on "train" in the filename, but EmoTaG uses transforms.json, so the priors never loaded and the geometric loss was always skipped.)
-                normal_path_candidates = glob.glob(os.path.join(path, 'sapiens/normal/sapiens_*'))
+            normal_path_candidates = glob.glob(os.path.join(path, 'sapiens/normal/sapiens_*')) if N_views > 0 else []
+            depth_path_candidates_ = glob.glob(os.path.join(path, 'sapiens/depth/sapiens_*')) if N_views > 0 else []
+            if N_views > 0 and not (normal_path_candidates and depth_path_candidates_) and idx == 0:
+                print(f'[data] no Sapiens priors under {path}/sapiens: geometric loss disabled for this scene '
+                      f'(run tools/run_sapiens_priors.sh for adaptation scenes).')
+            if N_views > 0 and normal_path_candidates and depth_path_candidates_:
                 normal_path_candidates.sort(reverse=True)
                 normal_path = os.path.join(normal_path_candidates[0], str(img_id) + '.npy')
                 talking_dict['normal_path'] = normal_path
@@ -253,9 +260,9 @@ def readNerfSyntheticInfo(path, white_background, eval, extension='.jpg', args=N
         sys.exit(1)
     if not eval:
         print('Reading Training Transforms')
-        train_cam_infos = readCamerasFromTransforms(path, 'transforms.json', white_background, extension, args.audio_file, args.audio_extractor, args.N_views, preload=preload, model_center=model_center)
+        train_cam_infos = readCamerasFromTransforms(path, 'transforms.json', white_background, extension, args.audio_file, args.audio_extractor, args.N_views, preload=preload, model_center=model_center, audio_lag=getattr(args, 'audio_lag', 0))
     print('Reading Evaluation Transforms')
-    test_cam_infos = readCamerasFromTransforms(path, 'transforms.json', white_background, extension, args.audio_file, args.audio_extractor, -1, preload=preload, model_center=model_center)
+    test_cam_infos = readCamerasFromTransforms(path, 'transforms.json', white_background, extension, args.audio_file, args.audio_extractor, -1, preload=preload, model_center=model_center, audio_lag=getattr(args, 'audio_lag', 0))
     if all_for_train:
         train_cam_infos.extend(test_cam_infos)
     if eval:

@@ -7,8 +7,13 @@
 #   0. vhap_track_one.sh          (optional) VHAP track + export from a video
 #   1. import_vhap_export.py      VHAP export -> EmoTaG scene + FLAME/Gaussian init
 #   2. extract_landmarks.py       real FAN 68-pt landmarks (ori_imgs/<id>.lms)
-#   3. extract_wav2vec2_features  audio features (aud_w2v.npy)
+#   3. extract_wav2vec2_features  audio features: copies WAV to <scene>/aud.wav, then
+#      + extract_whisper_features aud_w2v.npy and aud_whisper.npy (SKIP_WHISPER=1 to skip).
+#      Check / fix the audio-video offset afterwards with tools/check_av_sync.py --fix
+#      (it re-extracts both feature files from the shifted aud.wav).
 #   4. extract_pyfeat_au.py       py-feat Action Units (au_features.csv)
+#  4b. refine_landmarks.py        (optional, RUN_REFINE=1) lips + eyelids of the tracked FLAME
+#                                 parameters re-fitted to the image; needs steps 1, 2 and 4
 #   5. extract_deepface_emotion   DeepFace emotion teacher (emotion_features.npy)
 #   6. extract_adaface_identity   AdaFace/CVLface identity descriptor (identity_feature.npy)
 #   7. run_sapiens_priors.sh      depth/normal priors (adaptation only; optional)
@@ -90,20 +95,39 @@ if [[ "${SKIP_LANDMARKS:-0}" != "1" ]]; then
   "$EMOTAG_PY" tools/extract_landmarks.py --scene "$scene" --device "${DEVICE:-cuda}"
 fi
 
-# ---- 3. Wav2Vec2 audio features -------------------------------------------
+# ---- 3. Audio features (Wav2Vec2 + Whisper) --------------------------------
 if [[ "${SKIP_AUDIO:-0}" != "1" ]]; then
   : "${WAV:?Set WAV to the scene audio .wav (or SKIP_AUDIO=1).}"
+  # Keep the audio with the scene: tools/check_av_sync.py and the renderer read <scene>/aud.wav.
+  if [[ "$(realpath "$WAV")" != "$(realpath -m "$scene/aud.wav")" ]]; then
+    cp "$WAV" "$scene/aud.wav"
+    # A fresh aud.wav cancels an earlier check_av_sync.py --fix (its shift is relative to the old backup).
+    rm -f "$scene/aud_sync_shift.txt" "$scene/aud_orig_unsynced.wav" "$scene"/aud_*_orig_unsynced.npy
+  fi
   echo "[3/8] Extracting Wav2Vec2 features"
   "$EMOTAG_PY" tools/extract_wav2vec2_features.py \
-    --wav "$WAV" \
+    --wav "$scene/aud.wav" \
     --output "$scene/aud_w2v.npy" \
     --transforms "$scene/transforms.json"
+  if [[ "${SKIP_WHISPER:-0}" != "1" ]]; then
+    echo "[3/8] Extracting Whisper features"
+    "$EMOTAG_PY" tools/extract_whisper_features.py \
+      --wav "$scene/aud.wav" \
+      --output "$scene/aud_whisper.npy" \
+      --transforms "$scene/transforms.json"
+  fi
 fi
 
 # ---- 4. py-feat Action Unit features --------------------------------------
 if [[ "${SKIP_AU:-0}" != "1" ]]; then
   echo "[4/8] Extracting py-feat AU features"
   "$AU_PY" tools/extract_pyfeat_au.py --scene "$scene"
+fi
+
+# ---- 4b. (optional) lip + eyelid re-fit ------------------------------------
+if [[ "${RUN_REFINE:-0}" == "1" ]]; then
+  echo "[4b] Re-fitting lips and eyelids (flame_params.npz; tracked values kept as flame_params_tracked.npz)"
+  "$EMOTAG_PY" tools/refine_landmarks.py "$scene" --device "${DEVICE:-cuda}"
 fi
 
 # ---- 5. DeepFace emotion teacher ------------------------------------------

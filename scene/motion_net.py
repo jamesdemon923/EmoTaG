@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,8 +47,8 @@ class MotionNetwork(nn.Module):
 
     def __init__(self, audio_dim=256, ind_dim=32, args=None, num_speakers: int=None):
         super(MotionNetwork, self).__init__()
-        if args.audio_extractor != 'wav2vec2':
-            raise ValueError('EmoTaG expects --audio_extractor wav2vec2.')
+        if args.audio_extractor not in ('wav2vec2', 'whisper'):
+            raise ValueError('EmoTaG expects --audio_extractor wav2vec2 or whisper.')
         self.audio_in_dim = 768
         self.individual_dim = ind_dim
         if self.individual_dim > 0:
@@ -70,8 +71,6 @@ class MotionNetwork(nn.Module):
                 nn.init.zeros_(module.bias)
         nn.init.zeros_(self.au_fusion.weight)
         nn.init.zeros_(self.au_fusion.bias)
-        # AdaIN modulation of the audio and AU/expression streams, driven by the
-        # AdaFace identity descriptor `s`.
         self.identity_dim = 512
         self.audio_adain = nn.Sequential(nn.Linear(self.identity_dim, self.hidden_dim), nn.ReLU(inplace=True), nn.Linear(self.hidden_dim, 2 * self.audio_dim))
         self.au_adain = nn.Sequential(nn.Linear(self.identity_dim, self.hidden_dim), nn.ReLU(inplace=True), nn.Linear(self.hidden_dim, 2 * self.au_hidden_dim))
@@ -113,6 +112,11 @@ class MotionNetwork(nn.Module):
         self.mouth_head = nn.Linear(self.mouth_hidden_dim, 10)
         nn.init.normal_(self.mouth_head.weight, 0, 0.01)
         nn.init.zeros_(self.mouth_head.bias)
+        self.register_buffer('au_reference', torch.zeros(self.au_dim))
+        self.register_buffer('upper_face_proj', torch.zeros(self.flame_exp_dim, self.flame_exp_dim))
+        self.register_buffer('au_decoupled', torch.zeros(()))
+        self.novel_code = nn.Parameter(torch.zeros(1, max(1, self.individual_dim)))
+        self.register_buffer('use_novel_code', torch.zeros(()))
 
     def encode_audio(self, a, return_logits: bool=False):
         if a is None:
@@ -132,9 +136,6 @@ class MotionNetwork(nn.Module):
         proj = self.pos_encoder(proj)
         encoded_seq = self.audio_transformer(proj)
         audio_tokens = encoded_seq
-        # Center-token readout instead of mean pooling: the wav2vec sub-tokens span a
-        # short window and averaging them low-passes articulation timing. Self-attention
-        # still mixes the full window into the center token as context.
         pooled = audio_tokens[:, audio_tokens.shape[1] // 2]
         if return_logits:
             return (pooled, None)
@@ -175,7 +176,7 @@ class MotionNetwork(nn.Module):
         if au.shape[0] == 1 and batch_size > 1:
             au = au.repeat(batch_size, 1)
         elif au.shape[0] != batch_size:
-            au = au[:1].repeat(batch_size, 1)
+            au = au[au.shape[0] // 2:au.shape[0] // 2 + 1].repeat(batch_size, 1)
         return self.au_encoder(au)
 
     @staticmethod
@@ -193,31 +194,81 @@ class MotionNetwork(nn.Module):
         feat_xz = self.encoder_xz(xz, bound=bound)
         return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
 
+    def _motion_heads(self, shared: torch.Tensor):
+        base_exp = self.flame_exp_head(shared)
+        base_jaw = self.flame_jaw_head(shared)
+        base_motion = torch.cat([base_exp, base_jaw], dim=-1)
+        residual_motion = self.residual_motion_head(self.residual_net(shared))
+        gate = torch.sigmoid(self.gate_net(shared))
+        return base_motion + gate * residual_motion, base_exp, base_jaw, residual_motion, gate
+
+    def _encode_au_modulated(self, au, batch_size, identity, device, dtype):
+        au_feat = self.encode_au(au, batch_size=batch_size, device=device, dtype=dtype)
+        if identity is not None:
+            au_feat = self._adain(au_feat, identity, self.au_adain)
+        return self.au_fusion(au_feat)
+
+    @property
+    def is_au_decoupled(self) -> bool:
+        return bool(self.au_decoupled.item() > 0.5)
+
+    def configure_au_decoupling(self, au_reference, upper_face_proj, enabled: bool = True):
+        """Pin the lower face / jaw to audio and restrict AUs to the upper face."""
+        with torch.no_grad():
+            self.au_reference.copy_(torch.as_tensor(au_reference, dtype=self.au_reference.dtype))
+            self.upper_face_proj.copy_(torch.as_tensor(upper_face_proj, dtype=self.upper_face_proj.dtype))
+            self.au_decoupled.fill_(1.0 if enabled else 0.0)
+
+    def get_au_reference(self):
+        return self.au_reference.clone() if self.is_au_decoupled else None
+
+    def init_novel_code(self, trained_rows: int = None):
+        """Start the novel identity's code at the mean of the trained pre-training codes."""
+        if self.individual_dim <= 0:
+            return
+        with torch.no_grad():
+            codes = self.individual_codes.detach()
+            if trained_rows is None:
+                norms = codes.norm(dim=1)
+                trained = norms > 4.0 * norms.median()
+                rows = codes[trained] if trained.any() else codes[:1]
+            else:
+                rows = codes[:trained_rows]
+            self.novel_code.copy_(rows.mean(dim=0, keepdim=True))
+            self.use_novel_code.fill_(1.0)
+
+    def identity_code(self, index: int = 0):
+        if self.individual_dim <= 0:
+            return None
+        if self.use_novel_code.item() > 0.5:
+            return self.novel_code
+        return self.individual_codes[index:index + 1]
+
     def decode_motion(self, aud_feat: torch.Tensor, c: torch.Tensor=None, au: torch.Tensor=None, identity: torch.Tensor=None) -> dict:
         identity = self._prepare_identity(identity, device=aud_feat.device, dtype=aud_feat.dtype)
         if identity is not None:
             aud_feat = self._adain(aud_feat, identity, self.audio_adain)
         h = aud_feat
         if self.individual_dim > 0 and c is not None:
-            # Broadcast the per-identity code across the audio-window batch.
             if c.shape[0] != h.shape[0]:
                 c = c.expand(h.shape[0], -1)
             h = torch.cat([h, c], dim=-1)
-        shared = self.backbone_net(h)
-        au_feat = self.encode_au(au, batch_size=shared.shape[0], device=shared.device, dtype=shared.dtype)
-        if identity is not None:
-            au_feat = self._adain(au_feat, identity, self.au_adain)
-        shared = shared + self.au_fusion(au_feat)
-        base_exp = self.flame_exp_head(shared)
-        base_jaw = self.flame_jaw_head(shared)
-        base_motion = torch.cat([base_exp, base_jaw], dim=-1)
-        residual_hidden = self.residual_net(shared)
-        residual_motion = self.residual_motion_head(residual_hidden)
-        gate = torch.sigmoid(self.gate_net(shared))
-        motion = base_motion + gate * residual_motion
+        shared_audio = self.backbone_net(h)
+        batch = shared_audio.shape[0]
+        shared = shared_audio + self._encode_au_modulated(au, batch, identity, shared_audio.device, shared_audio.dtype)
+        motion, base_exp, base_jaw, residual_motion, gate = self._motion_heads(shared)
         pred_exp = motion[..., :self.flame_exp_dim]
         pred_jaw = motion[..., self.flame_exp_dim:]
-        return {'flame_exp': pred_exp, 'flame_jaw': pred_jaw, 'encoded_motion': shared, 'base_flame_exp': base_exp, 'base_flame_jaw': base_jaw, 'residual_flame_exp': residual_motion[..., :self.flame_exp_dim], 'residual_flame_jaw': residual_motion[..., self.flame_exp_dim:], 'gate': gate, 'emotion_logits': self.emotion_head(shared)}
+        au_delta_exp = None
+        if self.is_au_decoupled:
+            ref = self.au_reference.to(shared_audio.dtype).unsqueeze(0).expand(batch, -1)
+            shared_ref = shared_audio + self._encode_au_modulated(ref, batch, identity, shared_audio.device, shared_audio.dtype)
+            motion_ref, base_exp, base_jaw, residual_motion, _ = self._motion_heads(shared_ref)
+            exp_ref = motion_ref[..., :self.flame_exp_dim]
+            au_delta_exp = (pred_exp - exp_ref) @ self.upper_face_proj.to(pred_exp.dtype).T
+            pred_exp = exp_ref + au_delta_exp
+            pred_jaw = motion_ref[..., self.flame_exp_dim:]
+        return {'flame_exp': pred_exp, 'flame_jaw': pred_jaw, 'encoded_motion': shared, 'base_flame_exp': base_exp, 'base_flame_jaw': base_jaw, 'residual_flame_exp': residual_motion[..., :self.flame_exp_dim], 'residual_flame_jaw': residual_motion[..., self.flame_exp_dim:], 'gate': gate, 'emotion_logits': self.emotion_head(shared), 'au_delta_exp': au_delta_exp}
 
     def predict_jaw_from_audio(self, a: torch.Tensor, c: torch.Tensor=None, au: torch.Tensor=None, identity: torch.Tensor=None) -> torch.Tensor:
         aud_feat = self.encode_audio(a)
@@ -255,9 +306,6 @@ class MotionNetwork(nn.Module):
             h_in = torch.cat([enc_x, aud_rep], dim=-1)
         h1 = self.mouth_mlp(h_in)
         pred = self.mouth_head(h1)
-        # Bound the intra-oral corrections with tanh: there is no direct supervision on
-        # these fine deltas, so an unconstrained head can diverge. The caps leave ample
-        # room for real lip motion (FLAME jaw already handles the gross opening).
         d_mu = torch.tanh(pred[..., :3]) * 0.02
         d_rot = torch.tanh(pred[..., 3:7]) * 0.1
         d_scale = torch.tanh(pred[..., 7:10]) * 0.005
@@ -274,7 +322,14 @@ class MotionNetwork(nn.Module):
         self.cache = results
         return results
 
+    NEW_KEYS = ('au_reference', 'upper_face_proj', 'au_decoupled', 'novel_code', 'use_novel_code')
+
     def load_state_dict(self, state_dict, strict: bool=True):
+        state_dict = dict(state_dict)
+        own = super().state_dict()
+        for key in self.NEW_KEYS:
+            if key not in state_dict:
+                state_dict[key] = own[key]
         if strict:
             current_keys = set(self.state_dict().keys())
             loaded_keys = set(state_dict.keys())
@@ -285,19 +340,16 @@ class MotionNetwork(nn.Module):
                 strict = False
         return super().load_state_dict(state_dict, strict=strict)
 
-    def get_params(self, lr, lr_net, wd=0):
+    def get_params(self, lr, lr_net, wd=0, include_novel_code=False):
         params = [{'params': self.audio_proj.parameters(), 'name': 'neural_audio_proj', 'lr': lr_net, 'weight_decay': wd}, {'params': self.audio_transformer.parameters(), 'name': 'neural_audio_transformer', 'lr': lr_net, 'weight_decay': wd}, {'params': self.pos_encoder.parameters(), 'name': 'neural_pos_encoder', 'lr': lr_net, 'weight_decay': wd}, {'params': self.au_encoder.parameters(), 'name': 'neural_au_encoder', 'lr': lr_net, 'weight_decay': wd}, {'params': self.au_fusion.parameters(), 'name': 'neural_au_fusion', 'lr': lr_net, 'weight_decay': wd}, {'params': self.audio_adain.parameters(), 'name': 'neural_audio_adain', 'lr': lr_net, 'weight_decay': wd}, {'params': self.au_adain.parameters(), 'name': 'neural_au_adain', 'lr': lr_net, 'weight_decay': wd}, {'params': self.encoder_xy.parameters(), 'name': 'neural_encoder_xy', 'lr': lr}, {'params': self.encoder_yz.parameters(), 'name': 'neural_encoder_yz', 'lr': lr}, {'params': self.encoder_xz.parameters(), 'name': 'neural_encoder_xz', 'lr': lr}, {'params': self.mouth_mlp.parameters(), 'name': 'neural_mouth_mlp', 'lr': lr_net, 'weight_decay': wd}, {'params': self.mouth_head.parameters(), 'name': 'neural_mouth_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.backbone_net.parameters(), 'name': 'neural_backbone_net', 'lr': lr_net, 'weight_decay': wd}, {'params': self.flame_exp_head.parameters(), 'name': 'neural_flame_exp_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.flame_jaw_head.parameters(), 'name': 'neural_flame_jaw_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.residual_net.parameters(), 'name': 'neural_grmn_residual_net', 'lr': lr_net, 'weight_decay': wd}, {'params': self.residual_motion_head.parameters(), 'name': 'neural_grmn_residual_head', 'lr': lr_net, 'weight_decay': wd}, {'params': self.gate_net.parameters(), 'name': 'neural_grmn_gate', 'lr': lr_net, 'weight_decay': wd}, {'params': self.emotion_head.parameters(), 'name': 'neural_grmn_emotion_head', 'lr': lr_net, 'weight_decay': wd}]
         if self.individual_dim > 0:
             params.extend([{'params': self.individual_codes, 'name': 'neural_individual_codes', 'lr': lr, 'weight_decay': wd}])
+            if include_novel_code:
+                params.extend([{'params': [self.novel_code], 'name': 'neural_novel_code', 'lr': lr_net, 'weight_decay': 0.0}])
         return params
 
-    def freeze_for_adaptation(self, unfreeze_heads=False):
-        """Freeze the motion prior and tune only the AdaIN modulation parameters.
-
-        unfreeze_heads additionally lets the small prediction heads (FLAME exp/jaw
-        and the intra-oral triplane decoder) fine-tune: articulation style is
-        identity-specific and the frozen heads otherwise carry the pretrain corpus'
-        average articulation into the new identity."""
+    def freeze_for_adaptation(self, unfreeze_heads=False, unfreeze_backbone=False):
+        """Freeze the motion prior and tune only the AdaIN modulation parameters."""
         adain_modules = [self.audio_adain, self.au_adain]
         for param in self.parameters():
             param.requires_grad_(False)
@@ -306,6 +358,10 @@ class MotionNetwork(nn.Module):
                 m = getattr(self, name, None)
                 if m is not None:
                     adain_modules.append(m)
+        if unfreeze_backbone:
+            adain_modules.append(self.backbone_net.net[-1])
         for module in adain_modules:
             for param in module.parameters():
                 param.requires_grad_(True)
+        if self.individual_dim > 0 and self.use_novel_code.item() > 0.5:
+            self.novel_code.requires_grad_(True)
