@@ -301,6 +301,8 @@ python pretrain_emotag.py \
 > [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml); the EMA
 > checkpoint is written to `output/pretrain/chkpnt_ema_face_latest.pth`.
 > For multi-GPU, run `pretrain_emotag_ddp.py` with `torchrun` (same arguments).
+> Pre-training uses Wav2Vec2 features as in the paper; the released checkpoint then retrains its
+> audio-to-motion part on Whisper features ([Audio-to-motion training](#audio-to-motion-training)).
 
 ### Few-shot adaptation (target identity)
 
@@ -367,7 +369,7 @@ python tools/train_audio_prior.py --init output/prior/stage1.pth \
   --data data_prior/hdtf_tfhp --out output/prior/chkpnt_ema_face_latest.pth --steps 30000 --w_vertex 1 --align --select aperture
 ```
 
-`--init` is the pre-training checkpoint above. [`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) leaves out the
+`--init` is the pre-training checkpoint above (a new pre-training run gives a similar, not identical, starting point). [`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) leaves out the
 evaluation speakers and the clips whose audio contains an evaluation recording; the four train shards keep the clip order of
 our run. Preparation gives 1326 / 155 (FaceForensics++) and 868 / 117 (HDTF + TFHP) train / val clips. Each stage keeps its
 best checkpoint on the validation split (about 20 min for both stages on one GPU). Adapt with
