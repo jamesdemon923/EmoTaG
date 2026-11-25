@@ -120,6 +120,8 @@ def main():
             h_off.append(h_off[-1] + len(h))
             f_off.append(f_off[-1] + n)
         tag = f'{split}_{si}' if sn > 1 else split
+        if not kept:
+            raise SystemExit(f'[prep] {tag}: no clips')
         np.savez(os.path.join(args.out, f'{tag}.npz'), hidden=np.concatenate(hid), h_off=np.array(h_off),
                  exp=np.concatenate(exp), jaw=np.concatenate(jaw), f_off=np.array(f_off), names=np.array(kept))
         print(f'[prep] {tag}: {len(kept)} clips, {f_off[-1] / 25 / 3600:.2f} h', flush=True)

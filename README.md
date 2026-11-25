@@ -348,7 +348,7 @@ Public data:
 - HDTF + TFHP tracks: the `HDTF_TFHP-lmdb` folder of
   [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP) (requested through their form; `pip install lmdb`).
 - The [FLAME 2020](https://flame.is.tue.mpg.de) `generic_model.pkl`: both track sets use FLAME 2020 expressions,
-  which are mapped to the FLAME 2019 basis of EmoTaG.
+  which are mapped to the FLAME 2019 basis of EmoTaG (`EMOTAG_FLAME_MODEL` above).
 
 ```bash
 F2020=/path/to/FLAME2020/generic_model.pkl
@@ -367,9 +367,10 @@ python tools/train_audio_prior.py --init output/prior/stage1.pth \
   --data data_prior/hdtf_tfhp --out output/prior/chkpnt_ema_face_latest.pth --steps 30000 --w_vertex 1 --align --select aperture
 ```
 
-`--init` is the pre-training checkpoint above. [`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) lists the
-speakers and recordings of the evaluation scenes, which are left out; the four train shards keep the clip order of our run.
-Each stage keeps its best checkpoint on the validation split (about 20 min per stage on one GPU). Adapt with
+`--init` is the pre-training checkpoint above. [`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) leaves out the
+evaluation speakers and the clips whose audio contains an evaluation recording; the four train shards keep the clip order of
+our run. Preparation gives 1326 / 155 (FaceForensics++) and 868 / 117 (HDTF + TFHP) train / val clips. Each stage keeps its
+best checkpoint on the validation split (about 20 min for both stages on one GPU). Adapt with
 `--pretrain_path output/prior/chkpnt_ema_face_latest.pth --audio_extractor whisper`.
 
 ---
