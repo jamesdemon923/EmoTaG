@@ -6,7 +6,7 @@
 
 data:
   source_path: data/<ID>       # -s : one processed identity scene
-  audio_extractor: wav2vec2
+  audio_extractor: whisper
   N_views: 125                 # ~5s @25fps; use -1 to use all frames
 
 optimization:
@@ -33,7 +33,7 @@ misc:
 
 # Reference command:
 #   CUDA_VISIBLE_DEVICES=0 python adapt_emotag.py \
-#     -s data/<ID> -m output/adapt/<ID> --audio_extractor wav2vec2 \
+#     -s data/<ID> -m output/adapt/<ID> --audio_extractor whisper \
 #     --pretrain_path output/pretrain/chkpnt_ema_face_latest.pth \
 #     --iterations 20000 --warm_up_iter 1000 --adapt_adain_only --adapt_unfreeze_heads \
 #     --sh_degree 1 --N_views 125

@@ -109,21 +109,10 @@ bash tools/run_sapiens_priors.sh data/neutral_Obama
 `source_videos/` in the same folder holds the cropped 512×512 source clips for
 anyone who prefers to re-run the full preprocessing pipeline.
 
-**Scene patch (please update).** `scene_patch_v2.tar.gz` in the same folder fixes the
-audio/video offset of the released scenes and re-fits the tracked lips and eyelids
-(Step 4b). Extract it over `data/`:
-
-```bash
-tar xzf scene_patch_v2.tar.gz -C data/
-```
-
-The folder also holds the emotion-intensity test scenes (`test_data/emotional/intensity/`,
-Level-1/2/3 clips of `mead1_angry`, `mead2_happy`, `mead2_surprised`) and the adapted
-checkpoints of every scene (`adapted_checkpoints/<scene>.tar.gz`, extract into `output/`).
-
-Frames used per set: `neutral_<ID>` adapt on `[0, 125)`, evaluate on `[125, 375)`;
-`mead1_<e>` adapt on `[0, 125)`, evaluate on the separate recording `mead1_<e>_test`;
-`mead2_<e>` adapt on `[0, 125)`, evaluate from frame 150.
+**Update.** The test data have been updated (audio/video offset corrected; tracked lips and
+eyelids re-fitted, Step 4b). If you downloaded them earlier, please download them again.
+`test_data/emotional/intensity/` adds Level-1/2/3 clips of `mead1_angry`, `mead2_happy` and
+`mead2_surprised` for the emotion-intensity test.
 
 ---
 
@@ -206,8 +195,7 @@ python tools/extract_wav2vec2_features.py \
   --output     data/<ID>/aud_w2v.npy \
   --transforms data/<ID>/transforms.json
 
-# check / fix the audio-video offset (needs SYNCNET_ROOT=/path/to/syncnet_python)
-python tools/check_av_sync.py data/<ID>
+# fix the audio-video offset (needs SYNCNET_ROOT=/path/to/syncnet_python)
 python tools/check_av_sync.py data/<ID> --fix
 ```
 
@@ -228,12 +216,8 @@ python tools/extract_pyfeat_au.py --scene data/<ID>
 
 ### Step 4b — Lip and eyelid re-fit
 
-Re-fits the tracked FLAME expression and jaw to the lip landmarks and the blink AU
-(needs Steps 1, 2 and 4). Run it on adaptation and driving clips alike:
-
 ```bash
 python tools/refine_landmarks.py data/<ID>
-# -> data/<ID>/flame_params.npz (the tracked values are kept as flame_params_tracked.npz)
 ```
 
 ### Step 5 — Emotion teacher (DeepFace)
@@ -334,10 +318,6 @@ python adapt_emotag.py \
 > FLAME/mouth prediction heads. Full hyper-parameters are in
 > [`configs/adapt_5s.yaml`](configs/adapt_5s.yaml). `--pretrain_path` takes the
 > multi-identity EMA checkpoint from the pre-training root.
-> `--intraoral rigid` binds the mouth interior to a teeth geometry and
-> `--motion_steps` fits the audio-to-motion heads for a short schedule only.
-> Several clips of one person: process each clip on its own and add
-> `--extra_scenes data/<ID>_clip2 ...` (do not concatenate videos).
 
 ### Pretrained checkpoint
 
@@ -345,15 +325,8 @@ To skip pre-training, download the multi-identity motion prior and adapt directl
 
 ### 📦 [**Download checkpoint (Google Drive)**](https://drive.google.com/drive/folders/17wgFUGF7pxbW3QlBkiHQzo3nYTzF-fiN?usp=drive_link)
 
-`chkpnt_ema_face_latest.pth` has been updated (it now takes Whisper features,
-`--audio_extractor whisper`): please download it again.
-
-To skip the adaptation as well, use the adapted checkpoints of the evaluation scenes from
-the test-data folder:
-
-```bash
-tar xzf adapted_checkpoints/<scene>.tar.gz -C output/     # -> output/<scene>/
-```
+`chkpnt_ema_face_latest.pth` has been updated and now takes Whisper features
+(`--audio_extractor whisper`); please download it again.
 
 Pre-trained on quality-filtered HDTF identities
 (from [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt)) with the recipe
@@ -363,28 +336,16 @@ in [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
 
 ## Inference
 
-Render the composited video (the synthesized head over the background, torso from
-the source frames, the standard talking-head protocol):
+Render the composited video (the synthesized head over the per-frame
+torso+background, the standard talking-head protocol):
 
 ```bash
 python tools/render_composited.py -s data/<ID> -m output/<ID>
 ```
 
-This writes `output/<ID>/test/rendered_comp.mp4`, the matching `gt_comp.mp4` and
-versions with audio.
-
-```bash
-# novel audio: pose and AUs from the clip, audio from new.wav
-python tools/extract_whisper_features.py --wav new.wav --output new_whisper.npy
-python tools/render_composited.py -s data/<ID> -m output/<ID> \
-  --audio_file new_whisper.npy --wav new.wav --N_views -1
-
-# another clip of the same person (other emotion / recording)
-python tools/render_composited.py -s data/<driving clip> -m output/<ID>
-```
-
-An avatar reproduces what its 5-s adaptation clip shows; expressions that never occur
-in it (another emotion, a blink, a very wide mouth) are kept within the adapted range.
+This writes `output/<ID>/test/rendered_comp.mp4` and the matching
+`gt_comp.mp4`. Add `--bg_mode gt` to keep the source video's real background
+(when the scene has `bg_imgs/`, i.e. the original pre-matting frames).
 
 ---
 
@@ -399,21 +360,15 @@ python tools/render_composited.py -s data/<ID> -m output/<ID> --eval_from 125
 python evaluate_metrics.py video \
   output/<ID>/test/rendered_comp.mp4 \
   output/<ID>/test/gt_comp.mp4 \
-  output/<ID>/test --masks output/<ID>/test/masks_comp.npz
-
-# lip sync (SyncNet, needs SYNCNET_ROOT)
-python evaluate_metrics.py sync output/<ID>/test/rendered_comp.mp4 data/<ID>/aud.wav \
-  --audio_start_frame 125
+  output/<ID>/test
 ```
 
-The whole benchmark on the released scenes (held-out reconstruction, cross-recording,
-novel audio of another speaker / language, emotion intensity):
+All test settings on the released scenes:
 
 ```bash
 python tools/run_benchmark.py all --data data --output output       # models in output/<scene>
-python tools/run_benchmark.py eval --data data --model output/<scene> --scene <scene> --novel_audio xid
 python tools/run_benchmark.py eval --data data --model output/mead2_happy --scene mead2_happy \
-  --test_scene mead2_happy_lvl1 --tag intensity_lvl1
+  --test_scene mead2_happy_lvl1 --tag intensity_lvl1                # emotion intensity
 python tools/run_benchmark.py summary --output output
 ```
 

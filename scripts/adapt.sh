@@ -7,7 +7,7 @@ n_views=${3:-125}
 gpu_id=${4:?Usage: bash scripts/adapt.sh <scene_root> <output_root> <n_views> <gpu_id> <pretrain_checkpoint>}
 pretrain_checkpoint=${5:?Usage: bash scripts/adapt.sh <scene_root> <output_root> <n_views> <gpu_id> <pretrain_checkpoint>}
 
-audio_extractor=${AUDIO_EXTRACTOR:-wav2vec2}
+audio_extractor=${AUDIO_EXTRACTOR:-whisper}
 iterations=${ITERATIONS:-20000}
 warmup=${WARMUP_ITER:-1000}
 
