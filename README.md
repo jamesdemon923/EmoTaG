@@ -187,7 +187,9 @@ python tools/extract_landmarks.py --scene data/<ID>
 ### Step 3 — Audio features (Whisper / Wav2Vec2)
 
 EmoTaG supports two audio encoders (`--audio_extractor whisper` or `wav2vec2`); the released
-checkpoint uses Whisper.
+checkpoint uses Whisper. The audio of a recording is often a few frames off the video; since the
+mouth motion is learned from the audio, `check_av_sync.py` measures this offset with SyncNet and
+shifts the audio to match.
 
 ```bash
 python tools/extract_whisper_features.py \
@@ -216,6 +218,9 @@ python tools/extract_pyfeat_au.py --scene data/<ID>
 ```
 
 ### Step 4b — Lip and eyelid re-fit
+
+Monocular tracking often misses lip closures and blinks, which supervise the mouth and eyelid motion.
+This re-fits the lip and eyelid state to the image (the tracking is kept as `flame_params_tracked.npz`):
 
 ```bash
 python tools/refine_landmarks.py data/<ID>
