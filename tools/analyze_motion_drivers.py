@@ -90,8 +90,9 @@ def load_motion_net(ckpt_path: str, extractor: str = 'wav2vec2'):
         state = ck[0]
     else:
         state = ck
-    from utils.audio_features import check_prior_extractor
-    state = check_prior_extractor(state, extractor, ckpt_path)
+    from utils.audio_features import EXTRACTOR_KEY, check_prior_extractor
+    if EXTRACTOR_KEY in state:
+        state = check_prior_extractor(state, extractor, ckpt_path)
     net = MotionNetwork(args=SimpleNamespace(audio_extractor=extractor)).cuda()
     net.load_state_dict(state, strict=False)
     net.eval()

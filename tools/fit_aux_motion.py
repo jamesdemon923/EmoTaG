@@ -98,7 +98,8 @@ def main():
     ck = torch.load(args.pretrain_path, map_location='cpu', weights_only=False)
     state = ck[0] if isinstance(ck, (list, tuple)) and len(ck) == 3 else (ck[1] if isinstance(ck, (list, tuple)) else ck)
     from utils.audio_features import check_prior_extractor
-    state = check_prior_extractor(state, ext, args.pretrain_path)
+    state = check_prior_extractor(state, ext, args.pretrain_path,
+                                  untagged=None if isinstance(ck, (list, tuple)) and len(ck) == 4 else 'wav2vec2')
     primary = setup['clips'][0]
     lag, _ = calibrate_audio_lag(primary['source_path'], state, len(primary['frame_ids']), audio_extractor=ext)
     net = MotionNetwork(args=SimpleNamespace(audio_extractor=ext)).cuda()

@@ -123,6 +123,7 @@ the audio offset as in Step 3:
 ```bash
 EMOTAG_FLAME_MODEL=/path/to/FLAME/generic_model.pkl \
 VHAP_EXPORT=/path/to/VHAP/export/<ID> \
+VHAP_FRAMES=/path/to/VHAP/data/<ID>/images \
 WAV=data/<ID>/aud.wav \
 CVLFACE_ROOT=/path/to/CVLface \
 bash tools/preprocess_scene.sh data/<ID>
@@ -168,6 +169,7 @@ python tools/import_vhap_export.py \
   --vhap_export /path/to/VHAP/export/monocular/<ID>_whiteBg_staticOffset \
   --output      data/<ID> \
   --flame_model_path "$EMOTAG_FLAME_MODEL" \
+  --frames_dir  /path/to/VHAP/data/<ID>/images \
   --num_points 60000 \
   --link_mode  symlink
 ```
@@ -302,6 +304,34 @@ python pretrain_emotag.py \
 > checkpoint is written to `output/pretrain/chkpnt_ema_face_latest.pth`.
 > For multi-GPU, run `pretrain_emotag_ddp.py` with `torchrun` (same arguments).
 
+EmoTaG supports both Wav2Vec2 and Whisper features (`--audio_extractor`); the released checkpoint uses Whisper.
+To obtain it, train the audio-to-motion part of the pre-trained model on public FLAME tracks of talking-head videos:
+- FaceForensics++: `D5_unitalker_faceforensics++` from the
+  [UniTalker data release V1](https://github.com/X-niper/UniTalker#download-data).
+- HDTF + TFHP: `HDTF_TFHP-lmdb` from
+  [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP) (`pip install lmdb`).
+- [FLAME 2020](https://flame.is.tue.mpg.de) `generic_model.pkl`, to map their expressions to FLAME 2019.
+
+```bash
+F2020=/path/to/FLAME2020/generic_model.pkl
+python tools/prepare_audio_prior_data.py --source unitalker --root /path/to/D5_unitalker_faceforensics++ \
+  --flame2020 $F2020 --out data_prior/d5
+for i in 0 1 2 3; do
+  python tools/prepare_audio_prior_data.py --source diffposetalk --root /path/to/HDTF_TFHP-lmdb --flame2020 $F2020 \
+    --exclude data/audio_prior_exclude.txt --splits train --shard $i/4 --out data_prior/hdtf_tfhp
+done
+python tools/prepare_audio_prior_data.py --source diffposetalk --root /path/to/HDTF_TFHP-lmdb --flame2020 $F2020 \
+  --exclude data/audio_prior_exclude.txt --splits val --out data_prior/hdtf_tfhp
+
+python tools/train_audio_prior.py --init output/pretrain/chkpnt_ema_face_latest.pth \
+  --data data_prior/d5 data_prior/hdtf_tfhp --out output/prior/stage1.pth --steps 40000
+python tools/train_audio_prior.py --init output/prior/stage1.pth \
+  --data data_prior/hdtf_tfhp --out output/prior/chkpnt_ema_face_latest.pth --steps 30000 --w_vertex 1 --align --select aperture
+```
+
+`output/prior/chkpnt_ema_face_latest.pth` is the released checkpoint;
+[`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) keeps the evaluation speakers and recordings out of training.
+
 ### Few-shot adaptation (target identity)
 
 ```bash
@@ -322,56 +352,15 @@ python adapt_emotag.py \
 > `--adapt_adain_only` freezes the pretrained GRMN and tunes only the AdaIN
 > modulation; `--adapt_unfreeze_heads` additionally fine-tunes the small
 > FLAME/mouth prediction heads. Full hyper-parameters are in
-> [`configs/adapt_5s.yaml`](configs/adapt_5s.yaml). `--pretrain_path` takes the
-> multi-identity EMA checkpoint from the pre-training root.
+> [`configs/adapt_5s.yaml`](configs/adapt_5s.yaml). `--pretrain_path` takes
+> `output/prior/chkpnt_ema_face_latest.pth` or the released checkpoint below; for Wav2Vec2, use
+> `output/pretrain/chkpnt_ema_face_latest.pth` with `--audio_extractor wav2vec2`.
 
 ### Pretrained checkpoint
 
 To skip pre-training, download the multi-identity motion prior and adapt directly:
 
 ### 📦 [**Download checkpoint (Google Drive)**](https://drive.google.com/drive/folders/17wgFUGF7pxbW3QlBkiHQzo3nYTzF-fiN?usp=drive_link)
-
-Pre-trained on quality-filtered HDTF identities
-(from [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt)). Its audio-to-motion part was
-then further trained with Whisper audio features, which are multilingual and give better lip
-sync on non-English speech (next section).
-
-### Audio-to-motion training
-
-The released checkpoint continues the pre-trained one on FLAME tracks of talking-head videos (audio and
-FLAME parameters only, no images), in two stages: stage 1 learns the mapping from Whisper features on
-FaceForensics++, HDTF and TFHP; stage 2 continues on HDTF and TFHP after removing each clip's audio-video offset.
-
-Public data:
-- FaceForensics++ tracks: `D5_unitalker_faceforensics++` from the
-  [UniTalker data release V1](https://github.com/X-niper/UniTalker#download-data) (only this folder is used).
-- HDTF + TFHP tracks: the `HDTF_TFHP-lmdb` folder of
-  [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP) (requested through their form; `pip install lmdb`).
-- The [FLAME 2020](https://flame.is.tue.mpg.de) `generic_model.pkl`: both track sets use FLAME 2020 expressions,
-  which are mapped to the FLAME 2019 basis of EmoTaG (`EMOTAG_FLAME_MODEL` above).
-
-```bash
-F2020=/path/to/FLAME2020/generic_model.pkl
-python tools/prepare_audio_prior_data.py --source unitalker --root /path/to/D5_unitalker_faceforensics++ \
-  --flame2020 $F2020 --out data_prior/d5
-for i in 0 1 2 3; do
-  python tools/prepare_audio_prior_data.py --source diffposetalk --root /path/to/HDTF_TFHP-lmdb --flame2020 $F2020 \
-    --exclude data/audio_prior_exclude.txt --splits train --shard $i/4 --out data_prior/hdtf_tfhp
-done
-python tools/prepare_audio_prior_data.py --source diffposetalk --root /path/to/HDTF_TFHP-lmdb --flame2020 $F2020 \
-  --exclude data/audio_prior_exclude.txt --splits val --out data_prior/hdtf_tfhp
-
-python tools/train_audio_prior.py --init output/pretrain/chkpnt_ema_face_latest.pth \
-  --data data_prior/d5 data_prior/hdtf_tfhp --out output/prior/stage1.pth --steps 40000
-python tools/train_audio_prior.py --init output/prior/stage1.pth \
-  --data data_prior/hdtf_tfhp --out output/prior/chkpnt_ema_face_latest.pth --steps 30000 --w_vertex 1 --align --select aperture
-```
-
-`--init` is the pre-training checkpoint above. [`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) leaves out the
-evaluation speakers and the clips whose audio contains an evaluation recording; the four train shards keep the clip order of
-our run. Preparation gives 1326 / 155 (FaceForensics++) and 868 / 117 (HDTF + TFHP) train / val clips. Each stage keeps its
-best checkpoint on the validation split (about 20 min for both stages on one GPU). Adapt with
-`--pretrain_path output/prior/chkpnt_ema_face_latest.pth --audio_extractor whisper`.
 
 ---
 

@@ -121,7 +121,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             f'Expected a 3-tuple EMA checkpoint, a 4-tuple per-scene checkpoint, or a raw state_dict.'
         )
     from utils.audio_features import check_prior_extractor
-    motion_params = check_prior_extractor(motion_params, dataset.audio_extractor, pretrain_ckpt_path)
+    motion_params = check_prior_extractor(motion_params, dataset.audio_extractor, pretrain_ckpt_path,
+                                          untagged=None if len(pretrain_ckpt) == 4 else 'wav2vec2')
     motion_net.load_state_dict(motion_params)
     flame_wrappers = [flame_wrapper]
     primary_cams = scene.getTrainCameras()
@@ -626,7 +627,8 @@ if __name__ == '__main__':
         _ck = torch.load(args.pretrain_path, map_location='cpu', weights_only=False)
         _state = _ck[0] if isinstance(_ck, (list, tuple)) and len(_ck) == 3 else (_ck[1] if isinstance(_ck, (list, tuple)) else _ck)
         from utils.audio_features import check_prior_extractor
-        _state = check_prior_extractor(_state, args.audio_extractor, args.pretrain_path)
+        _state = check_prior_extractor(_state, args.audio_extractor, args.pretrain_path,
+                                       untagged=None if isinstance(_ck, (list, tuple)) and len(_ck) == 4 else 'wav2vec2')
         args.audio_lag, _corr = calibrate_audio_lag(os.path.abspath(args.source_path), _state, args.N_views,
                                                     audio_extractor=args.audio_extractor)
         print(f'[adapt] audio lag calibrated on the adaptation clip: {args.audio_lag} frame(s); '
