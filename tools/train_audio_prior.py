@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Train the audio -> FLAME motion prior on (audio, FLAME track) pairs from tools/prepare_audio_prior_data.py.
 
-    python tools/train_audio_prior.py --init output/pretrain/chkpnt_ema_face_latest.pth --data data_prior/d5 data_prior/hdtf_tfhp --out output/prior/stage1.pth --steps 40000
-    python tools/train_audio_prior.py --init output/prior/stage1.pth --data data_prior/hdtf_tfhp --out output/prior/chkpnt_ema_face_latest.pth --steps 30000 --w_vertex 1 --align --select aperture
+    python tools/train_audio_prior.py --stage 1 --init output/pretrain/chkpnt_ema_face_latest.pth --data data_prior/d5 data_prior/hdtf_tfhp --out output/prior/stage1.pth
+    python tools/train_audio_prior.py --stage 2 --init output/prior/stage1.pth --data data_prior/hdtf_tfhp --out output/prior/chkpnt_ema_face_latest.pth
 
 Only the audio -> motion path is trained (no images); the output (state_dict, None, step) is used as --pretrain_path.
 --align first measures each clip's audio-video offset with the --init prior and removes it (offsets saved next to --out).
@@ -27,6 +27,8 @@ from utils.flame_regions import expression_region_bases
 
 EXTRACTOR, DEV = 'whisper', 'cuda'
 BATCH, SEQ, LR, W_JAW, W_VEL, EMA, EVAL_EVERY, AU_CONST = 64, 8, 1e-4, 100.0, 1.0, 0.999, 2000, 0.35
+STAGES = {1: dict(steps=40000, w_vertex=0.0, align=False, select='corr'),
+          2: dict(steps=30000, w_vertex=1.0, align=True, select='aperture')}
 LAGS = list(range(-8, 9))
 
 
@@ -162,12 +164,17 @@ def main():
     ap.add_argument('--init', required=True, help='motion prior to start from (3-tuple EMA checkpoint)')
     ap.add_argument('--data', nargs='+', required=True, help='tools/prepare_audio_prior_data.py output dirs')
     ap.add_argument('--out', required=True)
-    ap.add_argument('--steps', type=int, default=30000)
-    ap.add_argument('--w_vertex', type=float, default=0.0, help='weight of the lower-face vertex-displacement loss')
-    ap.add_argument('--align', action='store_true', help='remove per-clip audio-video offsets measured with the --init prior')
-    ap.add_argument('--select', choices=sorted(SCORES), default='corr',
+    ap.add_argument('--stage', type=int, choices=sorted(STAGES), default=1,
+                    help='1: all tracks; 2: per-clip audio-video offsets removed, lower-face vertex loss')
+    ap.add_argument('--steps', type=int, default=None)
+    ap.add_argument('--w_vertex', type=float, default=None, help='weight of the lower-face vertex-displacement loss')
+    ap.add_argument('--align', action='store_true', default=None, help='remove per-clip audio-video offsets measured with the --init prior')
+    ap.add_argument('--select', choices=sorted(SCORES), default=None,
                     help='validation score of the kept checkpoint: mean jaw + lower-face correlation, or lip-aperture medians')
     args = ap.parse_args()
+    for k, v in STAGES[args.stage].items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.manual_seed(0)
     gen = torch.Generator().manual_seed(0)

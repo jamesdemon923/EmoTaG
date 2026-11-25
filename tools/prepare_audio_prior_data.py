@@ -2,7 +2,7 @@
 """Prepare (audio, FLAME track) pairs for tools/train_audio_prior.py.
 
     python tools/prepare_audio_prior_data.py --source unitalker --root <D5_unitalker_faceforensics++> --flame2020 <FLAME2020/generic_model.pkl> --out data_prior/d5
-    python tools/prepare_audio_prior_data.py --source diffposetalk --root <HDTF_TFHP-lmdb> --flame2020 <FLAME2020/generic_model.pkl> --out data_prior/hdtf_tfhp --exclude data/audio_prior_exclude.txt
+    python tools/prepare_audio_prior_data.py --source diffposetalk --root <HDTF_TFHP-lmdb> --flame2020 <FLAME2020/generic_model.pkl> --out data_prior/hdtf_tfhp --shards 4
 
 Writes <out>/<split>[_<shard>].npz: hidden [sum T50, 768] fp16 (Whisper), h_off [n+1], exp [sum T25, 50] (FLAME 2019 basis,
 centred per clip), jaw [sum T25, 3], f_off [n+1], names.
@@ -92,17 +92,18 @@ def main():
     ap.add_argument('--root', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--flame2020', required=True, help='FLAME 2020 generic_model.pkl (basis of the tracks)')
-    ap.add_argument('--exclude', default=None, help='text file of clip names or speaker prefixes to leave out')
+    ap.add_argument('--exclude', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'audio_prior_exclude.txt'),
+                    help='text file of clip names or speaker prefixes to leave out (evaluation speakers and recordings)')
     ap.add_argument('--splits', nargs='+', default=['train', 'val'])
-    ap.add_argument('--shard', default='0/1', help='i/n: every n-th clip starting at i, written to <split>_<i>.npz')
+    ap.add_argument('--shards', type=int, default=1, help='write the train split as train_<i>.npz, every n-th clip starting at i')
     args = ap.parse_args()
     from tools.extract_whisper_features import WhisperEncoder
     os.makedirs(args.out, exist_ok=True)
-    si, sn = (int(x) for x in args.shard.split('/'))
     exclude = [x.strip() for x in open(args.exclude) if x.strip()] if args.exclude else []
     encoder, maps = WhisperEncoder(), {}
     gen = clips_unitalker if args.source == 'unitalker' else clips_diffposetalk
-    for split in args.splits:
+    for split, si, sn in [(sp, i, args.shards if sp == 'train' else 1) for sp in args.splits
+                          for i in range(args.shards if sp == 'train' else 1)]:
         names = [n for n in split_names(args.source, args.root, split) if not excluded(n, exclude)][si::sn]
         hid, exp, jaw, kept, h_off, f_off = [], [], [], [], [0], [0]
         for name, wav, e, j, fps, n in gen(args.root, split, names):
