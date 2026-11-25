@@ -111,7 +111,7 @@ anyone who prefers to re-run the full preprocessing pipeline.
 
 **Update.** The test data have been updated (audio/video offset corrected; tracked lips and
 eyelids re-fitted, Step 4b). If you downloaded them earlier, please download them again.
-`test_data/emotional/intensity/` adds Level-1/2/3 clips of `mead1_angry`, `mead2_happy` and
+`processed_scenes/emotional/intensity/` adds Level-1/2/3 clips of `mead1_angry`, `mead2_happy` and
 `mead2_surprised` for the emotion-intensity test.
 
 ---
