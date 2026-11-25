@@ -2,8 +2,7 @@
 """EmoTaG benchmark on the released evaluation scenes.
 
   neutral_<ID>  adapt on frames [0, 125), evaluate frames [125, 375)
-  mead1_<e>     adapt on frames [0, 125), evaluate the separate recording mead1_<e>_test
-  mead2_<e>     adapt on frames [0, 125), evaluate frames [150, end)
+  mead1_<e>, mead2_<e>  adapt on frames [0, 125), evaluate the test recording <scene>_test
   novel audio   neutral clips driven by another speaker (same / other language), Sync-C/E only
   --test_scene  evaluate on any separately tracked recording of the same identity
 
@@ -32,7 +31,7 @@ CROSS_IDENTITY = {
 }
 CROSS_LANGUAGE = {
     'neutral_chinese': 'neutral_english_w', 'neutral_english_w': 'neutral_chinese',
-    'neutral_french': 'neutral_Shaheen', 'neutral_Shaheen': 'neutral_french',
+    'neutral_Shaheen': 'neutral_macron',
     'neutral_Jaein': 'neutral_Lieu', 'neutral_Lieu': 'neutral_Jaein',
     'neutral_macron': 'neutral_english_w',
 }
@@ -72,7 +71,7 @@ def protocol(scene, data, novel_audio=None, sync_data=None, extractor='wav2vec2'
         return (os.path.join(data, scene), os.path.join(sync_data, src, 'aud.wav'), 0,
                 ['--audio_file', os.path.join(sync_data, src, 'aud_whisper.npy' if extractor == 'whisper' else 'aud_w2v.npy'),
                  '--N_views', '-1'], 0)
-    if scene.startswith('mead1_'):
+    if os.path.isdir(os.path.join(data, scene + '_test')):
         return os.path.join(data, scene + '_test'), os.path.join(sync_data, scene + '_test', 'aud.wav'), 0, ['--N_views', '-1'], 0
     start = 150 if scene.startswith('mead2_') else 125
     return os.path.join(data, scene), os.path.join(sync_data, scene, 'aud.wav'), start, [], start

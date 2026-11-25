@@ -94,7 +94,7 @@ python tools/crop_video.py --input raw.mp4 --output data/<ID>/<ID>.mp4
 
 ### Evaluation data
 
-The processed evaluation scenes (11 neutral identities + MEAD emotional sets,
+The processed evaluation scenes (10 neutral identities + MEAD emotional sets,
 ready for adaptation/evaluation without any preprocessing) are available here:
 
 ### 📦 [**Download test data (Google Drive)**](https://drive.google.com/drive/folders/1zVB6NwWjVlXnZozIXUJxcjLVEMku9kNW?usp=drive_link)
