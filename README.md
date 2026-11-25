@@ -284,6 +284,14 @@ The checker reports whether each required scene file is present and valid.
 
 ### Pre-training (multi-identity)
 
+Data:
+- HDTF: the 70 identities in [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt), processed as above.
+- FaceForensics++ FLAME tracks: `D5_unitalker_faceforensics++` from the
+  [UniTalker data release V1](https://github.com/X-niper/UniTalker#download-data).
+- HDTF + TFHP FLAME tracks: `HDTF_TFHP-lmdb` from
+  [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP) (`pip install lmdb`).
+- [FLAME 2020](https://flame.is.tue.mpg.de) `generic_model.pkl`, to map their expressions to FLAME 2019.
+
 ```bash
 python pretrain_emotag.py \
   -s data \
@@ -294,24 +302,8 @@ python pretrain_emotag.py \
   --warm_up_iter_per_scene 1000 \
   --w_flame_reg 1.0 \
   --batch_size 1
-```
 
-> `--iterations` is **per scene** (multiplied by the number of scenes
-> internally), so `3600` over the 70 HDTF ids is the paper's ~250K-step budget.
-> Full hyper-parameters are in
-> [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml); the EMA
-> checkpoint is written to `output/pretrain/chkpnt_ema_face_latest.pth`.
-> For multi-GPU, run `pretrain_emotag_ddp.py` with `torchrun` (same arguments).
-
-EmoTaG supports both Wav2Vec2 and Whisper features (`--audio_extractor`); the released checkpoint uses Whisper.
-To obtain it, train the audio-to-motion part of the pre-trained model on public FLAME tracks of talking-head videos:
-- FaceForensics++: `D5_unitalker_faceforensics++` from the
-  [UniTalker data release V1](https://github.com/X-niper/UniTalker#download-data).
-- HDTF + TFHP: `HDTF_TFHP-lmdb` from
-  [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP) (`pip install lmdb`).
-- [FLAME 2020](https://flame.is.tue.mpg.de) `generic_model.pkl`, to map their expressions to FLAME 2019.
-
-```bash
+# audio-to-motion part on the FLAME tracks, with Whisper features
 F2020=/path/to/FLAME2020/generic_model.pkl
 python tools/prepare_audio_prior_data.py --source unitalker --root /path/to/D5_unitalker_faceforensics++ \
   --flame2020 $F2020 --out data_prior/d5
@@ -328,8 +320,13 @@ python tools/train_audio_prior.py --init output/prior/stage1.pth \
   --data data_prior/hdtf_tfhp --out output/prior/chkpnt_ema_face_latest.pth --steps 30000 --w_vertex 1 --align --select aperture
 ```
 
-`output/prior/chkpnt_ema_face_latest.pth` is the released checkpoint;
-[`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) keeps the evaluation speakers and recordings out of training.
+> EmoTaG supports both Wav2Vec2 and Whisper features (`--audio_extractor`); the released checkpoint
+> uses Whisper and is `output/prior/chkpnt_ema_face_latest.pth`.
+> `--iterations` is **per scene** (multiplied by the number of scenes
+> internally), so `3600` over the 70 HDTF ids is the paper's ~250K-step budget.
+> Full hyper-parameters are in [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
+> For multi-GPU, run `pretrain_emotag_ddp.py` with `torchrun` (same arguments).
+> [`data/audio_prior_exclude.txt`](data/audio_prior_exclude.txt) keeps the evaluation speakers and recordings out of training.
 
 ### Few-shot adaptation (target identity)
 
