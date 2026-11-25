@@ -215,10 +215,6 @@ python tools/extract_pyfeat_au.py --scene data/<ID>
 # -> data/<ID>/au_features.csv
 ```
 
-> An OpenFace-based alternative wrapper (`tools/extract_openface_au.sh`, needs a
-> local OpenFace build via `OPENFACE_BIN`) is also provided; the released
-> checkpoint was trained with the py-feat features above.
-
 ### Step 4b — Lip and eyelid re-fit
 
 ```bash
