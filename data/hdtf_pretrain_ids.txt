@@ -1,5 +1,5 @@
 # EmoTaG HDTF pre-training identities (70 videos, one identity each, 90-240s).
-# Source clips: HDTF/data_90/processed_videos (512x512, 25fps, face-centered).
+# Official HDTF video names; crop each to 512x512 at 25 fps and process it as in the README.
 # Used as scene names for pretrain_emotag.py --scene_names_file.
 RD_Radio28_000
 RD_Radio3_000

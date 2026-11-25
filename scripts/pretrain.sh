@@ -25,6 +25,27 @@ output=${OUTPUT:-output}
 prior_data=${PRIOR_DATA:-data_prior}
 pretrain=${PRETRAIN:-}
 
+missing=()
+need() { eval "$1" || missing+=("$2"); }
+need '[[ -f "$d5/train.json" && -d "$d5/train" && -d "$d5/val" ]]' \
+  "$d5: unzip the UniTalker data release V1 and pass its D5_unitalker_faceforensics++ folder (https://github.com/X-niper/UniTalker#download-data)"
+need '[[ -f "$hdtf_tfhp/data.mdb" && -f "$hdtf_tfhp/train.txt" && -f "$hdtf_tfhp/val.txt" ]]' \
+  "$hdtf_tfhp: request HDTF_TFHP-lmdb from DiffPoseTalk (https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP)"
+need '[[ -f "$flame2020" ]]' "$flame2020: download the FLAME 2020 generic_model.pkl (https://flame.is.tue.mpg.de)"
+need '[[ -n "${EMOTAG_FLAME_MODEL:-}" && -n "${EMOTAG_VHAP_ROOT:-}" ]]' "set EMOTAG_FLAME_MODEL and EMOTAG_VHAP_ROOT (README, Installation)"
+need 'python -c "import lmdb, chumpy" 2>/dev/null' "pip install lmdb chumpy"
+if [[ -z "$pretrain" ]]; then
+  ids=$(grep -v '^#' data/hdtf_pretrain_ids.txt)
+  absent=$(for id in $ids; do [[ -f "$data/$id/transforms.json" ]] || echo "$id"; done)
+  need '[[ -z "$absent" ]]' "$(wc -w <<< "$absent") of $(wc -w <<< "$ids") HDTF scenes in data/hdtf_pretrain_ids.txt are not in $data/ \
+(e.g. $(head -1 <<< "$absent")): process them as in the README (Datasets, Data Preparation)"
+else
+  need '[[ -f "$pretrain" ]]' "PRETRAIN=$pretrain does not exist"
+fi
+if (( ${#missing[@]} )); then
+  printf 'Missing:\n'; printf '  - %s\n' "${missing[@]}"; exit 1
+fi
+
 if [[ -z "$pretrain" ]]; then
   # --iterations is per scene: 3600 over the 70 HDTF scenes is the paper's ~250K steps
   python pretrain_emotag.py -s "$data" -m "$output/pretrain" --scene_names_file data/hdtf_pretrain_ids.txt \
