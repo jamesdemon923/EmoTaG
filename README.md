@@ -301,6 +301,8 @@ python pretrain_emotag.py \
 > [`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml); the EMA
 > checkpoint is written to `output/pretrain/chkpnt_ema_face_latest.pth`.
 > For multi-GPU, run `pretrain_emotag_ddp.py` with `torchrun` (same arguments).
+> The released checkpoint adds a second stage that trains the audio-to-motion part on large-scale
+> FLAME tracks with multilingual Whisper features ([Audio-to-motion training](#audio-to-motion-training)).
 
 ### Few-shot adaptation (target identity)
 
