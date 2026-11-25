@@ -180,6 +180,10 @@ python tools/extract_landmarks.py --scene data/<ID>
 
 ### Step 3 — Audio features (Whisper / Wav2Vec2)
 
+The released checkpoint uses Whisper features (multilingual); Wav2Vec2 features are only
+needed for the first-release checkpoint or for pre-training with
+[`configs/pretrain_hdtf70.yaml`](configs/pretrain_hdtf70.yaml).
+
 ```bash
 python tools/extract_whisper_features.py \
   --wav        data/<ID>/aud.wav \
