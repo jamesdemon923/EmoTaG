@@ -284,13 +284,10 @@ The checker reports whether each required scene file is present and valid.
 
 ### Pre-training (multi-identity)
 
-Data:
-- HDTF: the 70 identities in [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt), processed as above.
-- FaceForensics++ FLAME tracks: `D5_unitalker_faceforensics++` from the
-  [UniTalker data release V1](https://github.com/X-niper/UniTalker#download-data).
-- HDTF + TFHP FLAME tracks: `HDTF_TFHP-lmdb` from
-  [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP) (`pip install lmdb`).
-- [FLAME 2020](https://flame.is.tue.mpg.de) `generic_model.pkl`, to map their expressions to FLAME 2019.
+Data: the HDTF identities in [`data/hdtf_pretrain_ids.txt`](data/hdtf_pretrain_ids.txt) (processed as above), and the
+FLAME tracks `D5_unitalker_faceforensics++` from [UniTalker](https://github.com/X-niper/UniTalker#download-data) and
+`HDTF_TFHP-lmdb` from [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk/tree/main/datasets/HDTF_TFHP)
+(both in [FLAME 2020](https://flame.is.tue.mpg.de)).
 
 ```bash
 python pretrain_emotag.py \
@@ -304,6 +301,7 @@ python pretrain_emotag.py \
   --batch_size 1
 
 # audio-to-motion part on the FLAME tracks, with Whisper features
+pip install lmdb
 F2020=/path/to/FLAME2020/generic_model.pkl
 python tools/prepare_audio_prior_data.py --source unitalker --root /path/to/D5_unitalker_faceforensics++ \
   --flame2020 $F2020 --out data_prior/d5
