@@ -106,13 +106,8 @@ tar xzf neutral_Obama.tar.gz -C data/
 bash tools/run_sapiens_priors.sh data/neutral_Obama
 ```
 
-`source_videos/` in the same folder holds the cropped 512×512 source clips for
-anyone who prefers to re-run the full preprocessing pipeline.
-
-**Update.** The test data have been updated (audio/video offset corrected; tracked lips and
-eyelids re-fitted, Step 4b). If you downloaded them earlier, please download them again.
-`processed_scenes/emotional/intensity/` adds Level-1/2/3 clips of `mead1_angry`, `mead2_happy` and
-`mead2_surprised` for the emotion-intensity test.
+See `README.txt` in the folder for its contents. The data were updated recently;
+if you downloaded them earlier, please download them again.
 
 ---
 
@@ -352,7 +347,7 @@ This writes `output/<ID>/test/rendered_comp.mp4` and the matching
 ## Evaluation
 
 Render the held-out segment (frames after the 5s/125-frame adaptation clip)
-and compute the video metrics on it:
+and compute the video metrics on it (commands for each test set: `README.txt` of the test data):
 
 ```bash
 python tools/render_composited.py -s data/<ID> -m output/<ID> --eval_from 125
@@ -367,8 +362,6 @@ All test settings on the released scenes:
 
 ```bash
 python tools/run_benchmark.py all --data data --output output       # models in output/<scene>
-python tools/run_benchmark.py eval --data data --model output/mead2_happy --scene mead2_happy \
-  --test_scene mead2_happy_lvl1 --tag intensity_lvl1                # emotion intensity
 python tools/run_benchmark.py summary --output output
 ```
 
